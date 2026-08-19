@@ -98,6 +98,20 @@ export function disableFocusReporting(): string {
   return `${ESC}?1004l`;
 }
 
+/**
+ * Ask the terminal to wrap pasted text in `\x1b[200~` / `\x1b[201~`. flash
+ * never turns this on — herdr enables it for every pane on its own, so
+ * `caps.ts` explicitly disables it on entry and on restore. `term/input.ts`
+ * also discards the markers defensively in case one arrives anyway.
+ */
+export function enableBracketedPaste(): string {
+  return `${ESC}?2004h`;
+}
+
+export function disableBracketedPaste(): string {
+  return `${ESC}?2004l`;
+}
+
 // ── erase ──
 
 export function eraseScreen(): string {

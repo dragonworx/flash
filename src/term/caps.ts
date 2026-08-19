@@ -10,9 +10,15 @@
 //     `leaveSession()` is idempotent — safe to call twice, safe to call
 //     before `enterSession()` ever ran.
 //   - `installCrashGuards()` wires `leaveSession()` into every way this
-//     process can stop: SIGINT, SIGTERM, a plain `exit`, and an uncaught
-//     exception. The terminal is always restored *before* anything else
-//     happens (printing the error, choosing an exit code).
+//     process can stop: `exit`, `uncaughtException`, `unhandledRejection`,
+//     SIGINT, SIGTERM, SIGHUP, and SIGQUIT. The terminal is always restored
+//     *before* anything else happens (printing the error, choosing an exit
+//     code).
+//   - Verified on this machine: `process.on("exit")` does **not** fire when
+//     Bun is killed by SIGTERM, so `leaveSession()` cannot be left to that
+//     handler alone. Every terminating signal calls it directly and then
+//     exits itself; `exit` stays wired as a last-resort net for exit paths
+//     this file didn't anticipate, and stays idempotent so that's safe.
 //   - `process.stdin.setRawMode` is `undefined` when stdin is not a TTY
 //     (piped input, CI, this very environment). Calling it would throw
 //     "setRawMode is not a function"; instead `enterSession()` checks first
@@ -55,6 +61,10 @@ export function enterSession(): void {
   write(ansi.hideCursor());
   process.stdin.setRawMode(true);
   write(ansi.enableFocusReporting());
+  // herdr turns bracketed paste on for every pane it spawns; flash has no
+  // use for it and disables it defensively rather than trusting it stays
+  // off (see ansi.ts and term/input.ts).
+  write(ansi.disableBracketedPaste());
   sessionActive = true;
 }
 
@@ -66,10 +76,14 @@ export function leaveSession(): void {
   if (!sessionActive) return;
   sessionActive = false;
 
+  write(ansi.disableBracketedPaste());
   write(ansi.disableFocusReporting());
   if (typeof process.stdin.setRawMode === "function") {
     process.stdin.setRawMode(false);
   }
+  // Reset SGR state before leaving the alt screen — otherwise a colored
+  // cell left active at crash time can bleed into the restored shell.
+  write(ansi.reset());
   write(ansi.showCursor());
   write(ansi.exitAltScreen());
 }
@@ -79,23 +93,34 @@ export function leaveSession(): void {
 let guardsInstalled = false;
 
 /**
- * Register terminal restoration on every path this process can stop:
- * SIGINT, SIGTERM, a normal `exit`, and an uncaught exception. Safe to call
- * more than once — only the first call wires anything up.
+ * Register terminal restoration on every path this process can stop: a
+ * normal `exit`, an uncaught exception or rejection, and SIGINT/SIGTERM/
+ * SIGHUP/SIGQUIT. Safe to call more than once — only the first call wires
+ * anything up.
+ *
+ * Every signal below restores the terminal and exits itself, rather than
+ * relying on the `exit` handler to do it — `process.on("exit")` does not
+ * fire when Bun is killed by SIGTERM (verified on this machine), so a
+ * SIGTERM'd flash would otherwise strand the user with a hidden cursor in
+ * the alternate screen. `exit` stays registered as a last-resort net for
+ * any exit path this file didn't anticipate.
  */
 export function installCrashGuards(): void {
   if (guardsInstalled) return;
   guardsInstalled = true;
 
-  process.on("SIGINT", () => {
-    leaveSession();
-    process.exit(0);
-  });
+  const terminatingSignal = (signal: NodeJS.Signals, code: number) => {
+    process.on(signal, () => {
+      leaveSession();
+      process.exit(code);
+    });
+  };
 
-  process.on("SIGTERM", () => {
-    leaveSession();
-    process.exit(0);
-  });
+  // Exit codes follow the usual 128+signal convention.
+  terminatingSignal("SIGINT", 130);
+  terminatingSignal("SIGTERM", 143);
+  terminatingSignal("SIGHUP", 129);
+  terminatingSignal("SIGQUIT", 131);
 
   process.on("exit", () => {
     leaveSession();
@@ -107,6 +132,14 @@ export function installCrashGuards(): void {
     // scrolls off inside the alternate screen buffer and the user never
     // sees it.
     process.stderr.write(`flash: uncaught exception\n${errorDetail(err)}\n`);
+    process.exit(1);
+  });
+
+  process.on("unhandledRejection", (reason) => {
+    leaveSession();
+    process.stderr.write(
+      `flash: unhandled rejection\n${errorDetail(reason)}\n`,
+    );
     process.exit(1);
   });
 }
@@ -121,21 +154,38 @@ function errorDetail(err: unknown): string {
 export type Size = { columns: number; rows: number };
 
 const FALLBACK_SIZE: Size = { columns: 80, rows: 24 };
+const MIN_DIMENSION = 1;
+
+function envDimension(name: string): number | undefined {
+  const raw = process.env[name];
+  if (!raw) return undefined;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : undefined;
+}
 
 /**
- * Current terminal size, read from the pty (never from `$COLUMNS`/`$LINES`,
- * which multiplexers like herdr do not export). Falls back to 80x24 when
- * stdout is not a TTY, where `.columns`/`.rows` are `undefined`.
+ * Current terminal size, read primarily from the pty (herdr does not export
+ * `$COLUMNS`/`$LINES` at all). `process.stdout.columns`/`.rows` have been
+ * observed as both `undefined` (piped stdout) and `0` (one pty
+ * configuration) on this machine, so a non-positive reading falls through
+ * to `$COLUMNS`/`$LINES` when set, then to 80x24. The result is always
+ * floored at 1 so a degenerate terminal can never produce a negative
+ * layout width downstream.
  */
 export function size(): Size {
   const columns = process.stdout.columns;
   const rows = process.stdout.rows;
+  const resolvedColumns =
+    (typeof columns === "number" && columns > 0 ? columns : undefined) ??
+    envDimension("COLUMNS") ??
+    FALLBACK_SIZE.columns;
+  const resolvedRows =
+    (typeof rows === "number" && rows > 0 ? rows : undefined) ??
+    envDimension("LINES") ??
+    FALLBACK_SIZE.rows;
   return {
-    columns:
-      typeof columns === "number" && columns > 0
-        ? columns
-        : FALLBACK_SIZE.columns,
-    rows: typeof rows === "number" && rows > 0 ? rows : FALLBACK_SIZE.rows,
+    columns: Math.max(MIN_DIMENSION, resolvedColumns),
+    rows: Math.max(MIN_DIMENSION, resolvedRows),
   };
 }
 
