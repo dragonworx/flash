@@ -2,17 +2,19 @@
 // src/main.ts — flash entry point.
 //
 // Parses CLI flags, hardens `-d`, and either renders a single frame as plain
-// text (`--dump-frame`) or enters the full-screen session and runs the
-// read-only directory browser: input -> keymap -> Store -> render, wired
-// into the event-driven dirty-flag loop from Phase 1. See
-// /home/dev/.claude/plans/expressive-discovering-squid.md, "Phase 2".
+// text or real ANSI (`--dump-frame`) or enters the full-screen session and
+// runs the browser: input -> keymap -> Store -> render, wired into the
+// event-driven dirty-flag loop from Phase 1. See
+// /home/dev/.claude/plans/expressive-discovering-squid.md, "Phase 3" and the
+// visual-design/grid/config-persistence expansion of it.
 //
 // The render loop is still async and event-driven, not a fixed-rate tick —
 // see the Phase 1 comment below for why that invariant matters for Phase 5.
 //
 // Usage:
 //   flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|ascii]
-//         [--hidden] [--no-color] [--dump-frame --size WxH] [--help] [--version]
+//         [--hidden] [--no-color] [--dump-frame --size WxH [--color]]
+//         [--help] [--version]
 
 import {
   accessSync,
@@ -23,7 +25,14 @@ import {
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import pkg from "../package.json" with { type: "json" };
+import {
+  type Config,
+  DEFAULT_CONFIG,
+  loadConfig,
+  saveConfig,
+} from "./config.ts";
 import { resolveAction } from "./keymap.ts";
+import type { ViewMode } from "./state/store.ts";
 import { Store } from "./state/store.ts";
 import { setEnabled as setColorEnabled } from "./term/ansi.ts";
 import * as caps from "./term/caps.ts";
@@ -32,13 +41,25 @@ import * as osc from "./term/osc.ts";
 import { ATTR_DIM, Screen } from "./term/screen.ts";
 import { type IconSet, colors, isIconSet } from "./term/theme.ts";
 import { truncate } from "./term/width.ts";
-import { renderBreadcrumb, renderStatusBar } from "./ui/chrome.ts";
-import { renderListView } from "./ui/listView.ts";
+import {
+  computeFrame,
+  renderBanner,
+  renderRule,
+  renderStatusBar,
+} from "./ui/chrome.ts";
+import {
+  clampGridScroll,
+  computeGridLayout,
+  gridRowCount,
+  moveGridCursor,
+  renderGridView,
+} from "./ui/gridView.ts";
+import { renderListHeader, renderListView } from "./ui/listView.ts";
 
 // ── flag parsing ──
 
 const USAGE = `flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|ascii]
-      [--hidden] [--no-color] [--dump-frame --size WxH] [--help] [--version]
+      [--hidden] [--no-color] [--dump-frame --size WxH [--color]] [--help] [--version]
 
   -d, --dir <path>    directory to open; defaults to the current directory
       --view <mode>   initial view mode: list | grid
@@ -47,6 +68,7 @@ const USAGE = `flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|
       --no-color      disable color (also implied by NO_COLOR or a non-TTY stdout)
       --dump-frame    render one frame as text and exit (requires --size)
       --size <WxH>    terminal size to assume for --dump-frame
+      --color         with --dump-frame, emit real ANSI instead of plain text
   -h, --help          show this message
   -v, --version       print the version number
 `;
@@ -59,10 +81,16 @@ function parseFlags() {
         dir: { type: "string", short: "d" },
         view: { type: "string" },
         icons: { type: "string" },
-        hidden: { type: "boolean", default: false },
+        // No `default: false` here: `undefined` means "not passed", which
+        // is what lets a config-file value show through when the flag was
+        // never given (see `resolveEffectiveConfig` below). `--hidden` can
+        // still only ever *set* the flag true from the CLI — there is no
+        // `--no-hidden` — so undefined-vs-true is all that's needed.
+        hidden: { type: "boolean" },
         "no-color": { type: "boolean", default: false },
         "dump-frame": { type: "boolean", default: false },
         size: { type: "string" },
+        color: { type: "boolean", default: false },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -90,27 +118,13 @@ if (values.version) {
   process.exit(0);
 }
 
-const config = {
+const cliConfig = {
   dir: values.dir ?? ".",
-  hidden: values.hidden ?? false,
   noColor: values["no-color"] ?? false,
   dumpFrame: values["dump-frame"] ?? false,
   size: values.size,
+  color: values.color ?? false,
 };
-
-const viewMode: "list" | "grid" = values.view === "grid" ? "grid" : "list";
-
-// --no-color, NO_COLOR, and a non-TTY stdout all disable SGR the same way,
-// through the one kill switch in ansi.ts — Screen checks it too, so the
-// whole render path produces plain output on this branch. This must run
-// before anything renders, dump-frame included.
-if (
-  config.noColor ||
-  process.env.NO_COLOR !== undefined ||
-  !process.stdout.isTTY
-) {
-  setColorEnabled(false);
-}
 
 function fail(message: string): never {
   process.stderr.write(`flash: ${message}\n`);
@@ -119,6 +133,48 @@ function fail(message: string): never {
 
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+// ── config: file <- CLI flags, per the plan's "flags win" rule ──
+//
+// `--dump-frame` deliberately never touches the real config file — it is
+// used heavily by the test suite (tests/dump-frame.test.ts spawns the real
+// CLI repeatedly) and reading or writing `~/.config/flash/config.json` from
+// there would make snapshot output depend on whatever is on the machine
+// running the tests, and would leave writes behind. It gets `DEFAULT_CONFIG`
+// merged with flags only, same shape, zero disk I/O.
+const fileConfig: Config = cliConfig.dumpFrame
+  ? { ...DEFAULT_CONFIG }
+  : await loadConfig();
+
+const effectiveView: ViewMode =
+  values.view === "grid" || values.view === "list"
+    ? values.view
+    : fileConfig.view;
+const effectiveHidden = values.hidden === true ? true : fileConfig.showHidden;
+const iconsFlag = values.icons ?? fileConfig.icons;
+if (!isIconSet(iconsFlag)) {
+  fail(
+    `invalid --icons value '${iconsFlag}' (expected unicode, nerd, or ascii)`,
+  );
+}
+const iconSet: IconSet = iconsFlag;
+
+// --no-color, NO_COLOR, and a non-TTY stdout all disable SGR the same way,
+// through the one kill switch in ansi.ts — Screen checks it too, so the
+// whole render path produces plain output on this branch. This must run
+// before anything renders, dump-frame included. `--dump-frame --color`
+// (see Part 1 of the visual-design pass) is the one deliberate override: it
+// exists specifically to inspect real ANSI output without a TTY, so it
+// skips the non-TTY auto-disable that would otherwise always win here.
+const forceColorForDump = cliConfig.dumpFrame && cliConfig.color;
+if (
+  !forceColorForDump &&
+  (cliConfig.noColor ||
+    process.env.NO_COLOR !== undefined ||
+    !process.stdout.isTTY)
+) {
+  setColorEnabled(false);
 }
 
 /**
@@ -151,38 +207,65 @@ function resolveInitialDir(raw: string): string {
   return real;
 }
 
-const initialDir = resolveInitialDir(config.dir);
-
-const iconsFlag = values.icons ?? "unicode";
-if (!isIconSet(iconsFlag)) {
-  fail(
-    `invalid --icons value '${iconsFlag}' (expected unicode, nerd, or ascii)`,
-  );
-}
-const iconSet: IconSet = iconsFlag;
+const initialDir = resolveInitialDir(cliConfig.dir);
 
 const store = new Store({
   cwd: initialDir,
-  showHidden: config.hidden,
-  view: viewMode,
+  showHidden: effectiveHidden,
+  view: effectiveView,
+  sort: fileConfig.sort,
 });
 
-// ── shared layout + draw ──
-// listY is fixed at row 1 (breadcrumb owns row 0); statusY is the last row.
-// Both draw() and the interactive PgUp/PgDn page size below share this so
-// scrolling and rendering never disagree about how tall the list is.
-
-function computeLayout(h: number): {
-  listY: number;
-  listHeight: number;
-  statusY: number | null;
-} {
-  const height = Math.max(h, 1);
-  if (height === 1) return { listY: 1, listHeight: 0, statusY: null };
-  const statusY = height - 1;
-  const listY = 1;
-  return { listY, listHeight: Math.max(statusY - listY, 0), statusY };
+/** Snapshot the store + iconSet into the shape config.ts persists. */
+function currentConfig(): Config {
+  const state = store.getState();
+  return {
+    view: state.view,
+    sort: state.sort,
+    showHidden: state.showHidden,
+    icons: iconSet,
+  };
 }
+
+/**
+ * Fire-and-forget config write, called after every in-app change to view,
+ * sort, or hidden-file visibility — never on exit, since the process can be
+ * SIGKILLed and would never get to run an exit-time save. A write failure
+ * (disk full, permissions) surfaces as a transient status message rather
+ * than crashing the session.
+ */
+function persistConfig(): void {
+  if (cliConfig.dumpFrame) return; // see the file-config comment above
+  saveConfig(currentConfig()).catch((err) =>
+    store.setMessage(`failed to save config: ${errorMessage(err)}`, "error"),
+  );
+}
+
+// A CLI flag that overrode the file (e.g. `--hidden` on a machine whose
+// config remembers hidden files off) is remembered for next time, exactly
+// like an in-app toggle — flags win this run, but don't get silently
+// forgotten if the user runs bare `flash` again next time expecting it.
+if (
+  !cliConfig.dumpFrame &&
+  (effectiveView !== fileConfig.view ||
+    effectiveHidden !== fileConfig.showHidden ||
+    iconSet !== fileConfig.icons)
+) {
+  persistConfig();
+}
+
+// ── shared layout + draw ──
+// `computeFrame` (ui/chrome.ts) decides which chrome elements exist this
+// frame and which row each lives on; draw() and the interactive PgUp/PgDn
+// page size below both read `frame.listHeight` from it, so scrolling and
+// rendering never disagree about how tall the list is.
+
+// Grid scrolling is measured in *grid rows*, not entries (many entries
+// share a row) — see ui/gridView.ts's `clampGridScroll`. It lives outside
+// Store because Store's `scrollTop` is list-view index space; this is
+// view-specific presentation state, reset whenever the directory or view
+// changes so a stale offset from a taller grid never leaks into a new one.
+let gridScrollRow = 0;
 
 function draw(screen: Screen): void {
   const w = Math.max(screen.columns, 1);
@@ -190,30 +273,61 @@ function draw(screen: Screen): void {
   screen.clear();
 
   const state = store.getState();
-  renderBreadcrumb(screen, 0, 0, w, state.cwd);
+  const frame = computeFrame(w, h, state.view);
 
-  const { listY, listHeight, statusY } = computeLayout(h);
-  if (listHeight > 0) {
+  renderBanner(screen, w, frame, state.cwd);
+  const listEntries = state.view === "list" ? store.visibleEntries() : [];
+  if (frame.headerY !== null && state.view === "list") {
+    renderListHeader(screen, 0, frame.headerY, w, listEntries);
+  }
+  if (frame.headerRuleY !== null) renderRule(screen, frame.headerRuleY, w);
+
+  if (frame.listHeight > 0) {
     if (state.scanError) {
-      screen.put(0, listY, truncate(`error: ${state.scanError}`, w), {
+      screen.put(0, frame.listY, truncate(`error: ${state.scanError}`, w), {
         fg: colors.error,
       });
       screen.put(
         0,
-        listY + 1,
-        listHeight > 1 ? truncate("press ← to go up", w) : "",
+        frame.listY + 1,
+        frame.listHeight > 1 ? truncate("press ← to go up", w) : "",
         { attr: ATTR_DIM },
       );
+    } else if (state.view === "grid") {
+      const entries = store.visibleEntries();
+      const layout = computeGridLayout(
+        w,
+        entries.map((e) => e.width),
+      );
+      const rows = gridRowCount(entries.length, layout.columns);
+      const cursorRow = layout.columns > 0 ? state.cursor % rows : 0;
+      gridScrollRow = clampGridScroll(
+        gridScrollRow,
+        cursorRow,
+        frame.listHeight,
+        rows,
+      );
+      renderGridView(
+        screen,
+        0,
+        frame.listY,
+        w,
+        frame.listHeight,
+        entries,
+        state.cursor,
+        gridScrollRow,
+        iconSet,
+      );
     } else {
-      store.ensureVisible(listHeight);
+      store.ensureVisible(frame.listHeight);
       const after = store.getState();
       renderListView(
         screen,
         0,
-        listY,
+        frame.listY,
         w,
-        listHeight,
-        store.visibleEntries(),
+        frame.listHeight,
+        listEntries,
         after.cursor,
         after.scrollTop,
         iconSet,
@@ -221,8 +335,9 @@ function draw(screen: Screen): void {
     }
   }
 
-  if (statusY !== null) {
-    renderStatusBar(screen, 0, statusY, w, {
+  if (frame.footerRuleY !== null) renderRule(screen, frame.footerRuleY, w);
+  if (frame.statusY !== null) {
+    renderStatusBar(screen, 0, frame.statusY, w, {
       itemCount: store.itemCount(),
       markedCount: state.marked.size,
       message: state.message,
@@ -232,10 +347,16 @@ function draw(screen: Screen): void {
   screen.flush();
 }
 
-// ── --dump-frame: render exactly one frame as plain text, no TTY needed ──
+// ── --dump-frame: render exactly one frame and exit, no TTY needed ──
+//
+// Plain text by default (`Screen.renderPlainText()`), or the real ANSI
+// frame with `--color` (see the visual-design pass's Part 1) — the same
+// collector-sink pattern `tests/screen.test.ts` already uses to keep raw
+// escapes out of the test runner's own output, just used here to capture
+// them on purpose instead of discarding them.
 
-if (config.dumpFrame) {
-  const sizeMatch = /^(\d+)x(\d+)$/.exec(config.size ?? "");
+if (cliConfig.dumpFrame) {
+  const sizeMatch = /^(\d+)x(\d+)$/.exec(cliConfig.size ?? "");
   if (!sizeMatch) fail("--dump-frame requires --size WxH, e.g. --size 80x24");
   const columns = Number(sizeMatch[1]);
   const rows = Number(sizeMatch[2]);
@@ -243,9 +364,15 @@ if (config.dumpFrame) {
     fail("--size must be positive, e.g. --size 80x24");
 
   await store.load(initialDir);
-  const screen = new Screen(columns, rows, () => {}); // never actually written to
+  const chunks: string[] = [];
+  const screen = new Screen(
+    columns,
+    rows,
+    forceColorForDump ? (chunk: string) => chunks.push(chunk) : () => {},
+  );
   draw(screen);
-  process.stdout.write(`${screen.renderPlainText()}\n`);
+  const output = forceColorForDump ? chunks.join("") : screen.renderPlainText();
+  process.stdout.write(`${output}\n`);
   process.exit(0);
 }
 
@@ -279,12 +406,15 @@ function requestRepaint(): void {
   });
 }
 
-// Re-announce OSC 7/0 only when cwd actually changes, not on every repaint.
+// Re-announce OSC 7/0 only when cwd actually changes, not on every repaint,
+// and reset the grid scroll offset then too — a stale offset from the
+// previous directory's (possibly much taller) grid must not leak in.
 let lastAnnouncedCwd: string | null = null;
 store.subscribe(() => {
   const cwd = store.getState().cwd;
   if (cwd !== lastAnnouncedCwd) {
     lastAnnouncedCwd = cwd;
+    gridScrollRow = 0;
     osc.announceDirectory(cwd);
   }
   requestRepaint();
@@ -302,11 +432,53 @@ function quit(): void {
   process.exit(0);
 }
 
+/**
+ * Resolve a `navigate` action against the current view. List mode
+ * reproduces Phase 2's original arrow behavior exactly (up/down move the
+ * cursor, left goes up a directory, right enters); grid mode moves the
+ * cursor geometrically via `moveGridCursor`, which needs the current grid
+ * layout — only known here, where terminal width is available (keymap.ts
+ * has no access to it, see the Action's comment).
+ */
+function handleNavigate(dir: "up" | "down" | "left" | "right"): void {
+  const state = store.getState();
+  if (state.view === "list") {
+    if (dir === "up") store.moveCursor(-1);
+    else if (dir === "down") store.moveCursor(1);
+    else if (dir === "left")
+      store.up().catch((err) => store.setMessage(errorMessage(err), "error"));
+    else
+      store
+        .enter()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+    return;
+  }
+
+  const entries = store.visibleEntries();
+  const layout = computeGridLayout(
+    Math.max(screen.columns, 1),
+    entries.map((e) => e.width),
+  );
+  if (layout.columns === 0) return;
+  const rows = gridRowCount(entries.length, layout.columns);
+  const next = moveGridCursor(
+    state.cursor,
+    entries.length,
+    layout.columns,
+    rows,
+    dir,
+  );
+  store.setCursorIndex(next);
+}
+
 input.onKey((key: Key) => {
   const action = resolveAction(key, store.getState());
   if (!action) return;
 
   switch (action.type) {
+    case "navigate":
+      handleNavigate(action.dir);
+      break;
     case "moveCursor":
       store.moveCursor(action.delta);
       break;
@@ -314,8 +486,12 @@ input.onKey((key: Key) => {
       store.moveCursorTo(action.pos);
       break;
     case "pageMove": {
-      const { listHeight } = computeLayout(screen.rows);
-      store.pageMove(action.direction, Math.max(listHeight, 1));
+      const frame = computeFrame(
+        Math.max(screen.columns, 1),
+        Math.max(screen.rows, 1),
+        store.getState().view,
+      );
+      store.pageMove(action.direction, Math.max(frame.listHeight, 1));
       break;
     }
     case "enter":
@@ -326,14 +502,21 @@ input.onKey((key: Key) => {
     case "up":
       store.up().catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
+    case "toggleView":
+      store.toggleView();
+      persistConfig();
+      break;
     case "toggleHidden":
       store.toggleHidden();
+      persistConfig();
       break;
     case "cycleSort":
       store.cycleSort();
+      persistConfig();
       break;
     case "toggleSortReverse":
       store.toggleSortReverse();
+      persistConfig();
       break;
     case "help":
       // Full help overlay is Phase 9 (?, generated from the keymap table);
@@ -346,7 +529,7 @@ input.onKey((key: Key) => {
     case "closeOverlay":
     case "clearMarks":
     case "leaveArchive":
-      // Unreachable in Phase 2 — no overlays, marks, or archives exist yet.
+      // Unreachable in Phase 3 — no overlays, marks, or archives exist yet.
       // See keymap.ts's Escape precedence table.
       break;
   }

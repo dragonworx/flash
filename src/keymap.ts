@@ -17,8 +17,11 @@
 // Phase 7 (overlays), and Phase 8 (archives) each slot in by editing one
 // guard function, not by restructuring this file.
 //
-// `←`, `h`, and `Backspace` bypass this table entirely and always go up, so
-// there is always a way to navigate that never depends on Escape's state.
+// `h` and `Backspace` bypass this table entirely and always go up, so there
+// is always a way to navigate that never depends on Escape's state. `←`
+// joins them in list view, but not in grid view — see the `navigate`
+// Action's comment below for why grid mode needs the literal arrow keys to
+// mean "move the cursor" instead.
 
 import type { AppState } from "./state/store.ts";
 import type { Key } from "./term/input.ts";
@@ -27,8 +30,16 @@ export type Action =
   | { type: "moveCursor"; delta: number }
   | { type: "moveCursorTo"; pos: "home" | "end" }
   | { type: "pageMove"; direction: "up" | "down" }
+  // Emitted only for the four literal arrow keys, never for h/j/k/l — see
+  // the comment on the switch statement below. main.ts resolves this
+  // against the current view: list mode reproduces the original
+  // up/down-move, left-go-up, right-enter behavior; grid mode moves the
+  // cursor geometrically (ui/gridView.ts's `moveGridCursor`), since a flat
+  // moveCursor delta would let ↑/↓ silently cross a column boundary.
+  | { type: "navigate"; dir: "up" | "down" | "left" | "right" }
   | { type: "enter" }
   | { type: "up" }
+  | { type: "toggleView" }
   | { type: "toggleHidden" }
   | { type: "cycleSort" }
   | { type: "toggleSortReverse" }
@@ -78,10 +89,20 @@ export function resolveAction(key: Key, state: AppState): Action | null {
   if (key.ctrl || key.alt) return null;
 
   switch (key.name) {
+    // The literal arrow keys are view-aware (see the `navigate` Action
+    // comment above) — only they change meaning in grid mode. The vi
+    // letters keep their plain list-style meaning in every view, so there
+    // is always a fixed, predictable set of bindings regardless of view.
     case "up":
+      return { type: "navigate", dir: "up" };
+    case "down":
+      return { type: "navigate", dir: "down" };
+    case "left":
+      return { type: "navigate", dir: "left" };
+    case "right":
+      return { type: "navigate", dir: "right" };
     case "k":
       return { type: "moveCursor", delta: -1 };
-    case "down":
     case "j":
       return { type: "moveCursor", delta: 1 };
     case "pageup":
@@ -94,13 +115,13 @@ export function resolveAction(key: Key, state: AppState): Action | null {
       return { type: "moveCursorTo", pos: "end" };
     case "enter":
     case "space":
-    case "right":
     case "l":
       return { type: "enter" };
-    case "left":
     case "h":
     case "backspace":
       return { type: "up" };
+    case "v":
+      return { type: "toggleView" };
     case ".":
       return { type: "toggleHidden" };
     case "s":

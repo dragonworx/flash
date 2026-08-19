@@ -232,6 +232,21 @@ export class Store {
     this.notify();
   }
 
+  /**
+   * Jump the cursor directly to `index`, clamped into range. Used by grid
+   * navigation (`ui/gridView.ts`'s `moveGridCursor`), which computes the
+   * destination index itself from 2D geometry rather than a simple delta.
+   */
+  setCursorIndex(index: number): void {
+    const list = this.visibleEntries();
+    if (list.length === 0) return;
+    this.state.cursor = Math.max(
+      0,
+      Math.min(list.length - 1, Math.trunc(index)),
+    );
+    this.notify();
+  }
+
   pageMove(direction: "up" | "down", pageSize: number): void {
     this.moveCursor(direction === "up" ? -pageSize : pageSize);
   }
@@ -282,6 +297,12 @@ export class Store {
   }
 
   // ── toggles ──
+
+  /** Toggle list/grid, per the visual-design pass's `v` binding. */
+  toggleView(): void {
+    this.state.view = this.state.view === "list" ? "grid" : "list";
+    this.notify();
+  }
 
   toggleHidden(): void {
     const list = this.visibleEntries();
