@@ -1,35 +1,39 @@
 #!/usr/bin/env bun
 // src/main.ts — flash entry point.
 //
-// Parses CLI flags, installs terminal crash guards, enters the full-screen
-// session, and — for this phase — draws a bordered placeholder box with the
-// current directory and a hint line, redrawing on resize and every
-// keypress, quitting cleanly on `q` or Ctrl+C. Real navigation, views, and
-// state wiring land in later phases; see
-// /home/dev/.claude/plans/expressive-discovering-squid.md.
+// Parses CLI flags, hardens `-d`, and either renders a single frame as plain
+// text (`--dump-frame`) or enters the full-screen session and runs the
+// read-only directory browser: input -> keymap -> Store -> render, wired
+// into the event-driven dirty-flag loop from Phase 1. See
+// /home/dev/.claude/plans/expressive-discovering-squid.md, "Phase 2".
 //
-// The render loop is event-driven, not a fixed-rate tick: input, resize,
-// and (in later phases) filesystem/progress events all just call
-// `requestRepaint()`, which sets a dirty flag and schedules a single
-// `draw()` on the next macrotask via `setImmediate`. Multiple triggers
-// inside the same tick collapse into one repaint. This is deliberate now,
-// not just here for style — Phase 5's copy/paste progress reporting fires
-// many events per second from an async job, and the loop needs to already
-// be "coalesce and redraw when idle" rather than "block and paint" for that
-// to stay responsive. Do not replace this with `while (true) { ... }`.
+// The render loop is still async and event-driven, not a fixed-rate tick —
+// see the Phase 1 comment below for why that invariant matters for Phase 5.
 //
 // Usage:
 //   flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|ascii]
 //         [--hidden] [--no-color] [--dump-frame --size WxH] [--help] [--version]
 
+import {
+  accessSync,
+  constants as fsConstants,
+  realpathSync,
+  statSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import pkg from "../package.json" with { type: "json" };
+import { resolveAction } from "./keymap.ts";
+import { Store } from "./state/store.ts";
 import { setEnabled as setColorEnabled } from "./term/ansi.ts";
 import * as caps from "./term/caps.ts";
 import { Input, type Key } from "./term/input.ts";
+import * as osc from "./term/osc.ts";
 import { ATTR_DIM, Screen } from "./term/screen.ts";
+import { type IconSet, colors, isIconSet } from "./term/theme.ts";
 import { truncate } from "./term/width.ts";
+import { renderBreadcrumb, renderStatusBar } from "./ui/chrome.ts";
+import { renderListView } from "./ui/listView.ts";
 
 // ── flag parsing ──
 
@@ -86,29 +90,20 @@ if (values.version) {
   process.exit(0);
 }
 
-// Only --dir is wired up for real in this phase. --view, --icons, --hidden,
-// --no-color, --dump-frame, and --size are accepted and stored below so the
-// flag surface matches the plan; later phases read them.
 const config = {
-  dir: resolve(process.cwd(), values.dir ?? "."),
-  view: values.view,
-  icons: values.icons,
+  dir: values.dir ?? ".",
   hidden: values.hidden ?? false,
   noColor: values["no-color"] ?? false,
   dumpFrame: values["dump-frame"] ?? false,
   size: values.size,
 };
 
-if (config.dumpFrame) {
-  process.stderr.write(
-    "flash: --dump-frame is not implemented yet (it lands with the renderer, in a later phase).\n",
-  );
-  process.exit(1);
-}
+const viewMode: "list" | "grid" = values.view === "grid" ? "grid" : "list";
 
 // --no-color, NO_COLOR, and a non-TTY stdout all disable SGR the same way,
 // through the one kill switch in ansi.ts — Screen checks it too, so the
-// whole render path produces plain output on this branch.
+// whole render path produces plain output on this branch. This must run
+// before anything renders, dump-frame included.
 if (
   config.noColor ||
   process.env.NO_COLOR !== undefined ||
@@ -117,36 +112,151 @@ if (
   setColorEnabled(false);
 }
 
-// ── session ──
+function fail(message: string): never {
+  process.stderr.write(`flash: ${message}\n`);
+  process.exit(1);
+}
 
-caps.installCrashGuards();
-caps.enterSession();
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
-// ── render loop: screen + input, event-driven with a coalesced repaint ──
+/**
+ * Harden `-d` per the plan: resolve relative-or-absolute against cwd,
+ * `realpath` it (so a dangling symlink or a typo fails here, not three
+ * screens deep into the app), and require a readable directory. Any
+ * failure prints a clear message and exits non-zero rather than opening
+ * something unexpected.
+ */
+function resolveInitialDir(raw: string): string {
+  const resolved = resolve(process.cwd(), raw);
+  let real: string;
+  try {
+    real = realpathSync(resolved);
+  } catch (err) {
+    return fail(`cannot access '${raw}': ${errorMessage(err)}`);
+  }
+  let isDir: boolean;
+  try {
+    isDir = statSync(real).isDirectory();
+  } catch (err) {
+    return fail(`cannot access '${raw}': ${errorMessage(err)}`);
+  }
+  if (!isDir) return fail(`'${raw}' is not a directory`);
+  try {
+    accessSync(real, fsConstants.R_OK | fsConstants.X_OK);
+  } catch {
+    return fail(`'${raw}' is not readable`);
+  }
+  return real;
+}
 
-const initialSize = caps.size();
-const screen = new Screen(initialSize.columns, initialSize.rows);
-const input = new Input();
+const initialDir = resolveInitialDir(config.dir);
 
-function draw(): void {
+const iconsFlag = values.icons ?? "unicode";
+if (!isIconSet(iconsFlag)) {
+  fail(
+    `invalid --icons value '${iconsFlag}' (expected unicode, nerd, or ascii)`,
+  );
+}
+const iconSet: IconSet = iconsFlag;
+
+const store = new Store({
+  cwd: initialDir,
+  showHidden: config.hidden,
+  view: viewMode,
+});
+
+// ── shared layout + draw ──
+// listY is fixed at row 1 (breadcrumb owns row 0); statusY is the last row.
+// Both draw() and the interactive PgUp/PgDn page size below share this so
+// scrolling and rendering never disagree about how tall the list is.
+
+function computeLayout(h: number): {
+  listY: number;
+  listHeight: number;
+  statusY: number | null;
+} {
+  const height = Math.max(h, 1);
+  if (height === 1) return { listY: 1, listHeight: 0, statusY: null };
+  const statusY = height - 1;
+  const listY = 1;
+  return { listY, listHeight: Math.max(statusY - listY, 0), statusY };
+}
+
+function draw(screen: Screen): void {
   const w = Math.max(screen.columns, 1);
   const h = Math.max(screen.rows, 1);
-
   screen.clear();
-  screen.box(0, 0, w, h, {});
 
-  const innerWidth = Math.max(w - 4, 0);
-  if (h > 1) {
-    screen.put(2, 1, truncate(`flash — ${config.dir}`, innerWidth), {});
+  const state = store.getState();
+  renderBreadcrumb(screen, 0, 0, w, state.cwd);
+
+  const { listY, listHeight, statusY } = computeLayout(h);
+  if (listHeight > 0) {
+    if (state.scanError) {
+      screen.put(0, listY, truncate(`error: ${state.scanError}`, w), {
+        fg: colors.error,
+      });
+      screen.put(
+        0,
+        listY + 1,
+        listHeight > 1 ? truncate("press ← to go up", w) : "",
+        { attr: ATTR_DIM },
+      );
+    } else {
+      store.ensureVisible(listHeight);
+      const after = store.getState();
+      renderListView(
+        screen,
+        0,
+        listY,
+        w,
+        listHeight,
+        store.visibleEntries(),
+        after.cursor,
+        after.scrollTop,
+        iconSet,
+      );
+    }
   }
-  if (h > 2) {
-    screen.put(2, 2, truncate("press q or Ctrl+C to quit", innerWidth), {
-      attr: ATTR_DIM,
+
+  if (statusY !== null) {
+    renderStatusBar(screen, 0, statusY, w, {
+      itemCount: store.itemCount(),
+      markedCount: state.marked.size,
+      message: state.message,
     });
   }
 
   screen.flush();
 }
+
+// ── --dump-frame: render exactly one frame as plain text, no TTY needed ──
+
+if (config.dumpFrame) {
+  const sizeMatch = /^(\d+)x(\d+)$/.exec(config.size ?? "");
+  if (!sizeMatch) fail("--dump-frame requires --size WxH, e.g. --size 80x24");
+  const columns = Number(sizeMatch[1]);
+  const rows = Number(sizeMatch[2]);
+  if (columns <= 0 || rows <= 0)
+    fail("--size must be positive, e.g. --size 80x24");
+
+  await store.load(initialDir);
+  const screen = new Screen(columns, rows, () => {}); // never actually written to
+  draw(screen);
+  process.stdout.write(`${screen.renderPlainText()}\n`);
+  process.exit(0);
+}
+
+// ── interactive session ──
+
+caps.installCrashGuards();
+caps.enterSession();
+
+const initialSize = caps.size();
+const screen = new Screen(initialSize.columns, initialSize.rows);
+const input = new Input();
 
 let dirty = false;
 let repaintScheduled = false;
@@ -165,14 +275,26 @@ function requestRepaint(): void {
     repaintScheduled = false;
     if (!dirty) return;
     dirty = false;
-    draw();
+    draw(screen);
   });
 }
 
-// ── input: quit on q or Ctrl+C, redraw on everything else ──
-// Raw mode disables signal-generating control characters, so SIGINT is not
-// delivered for Ctrl+C while the session is active — term/input.ts detects
-// it in the byte stream instead (0x03 -> {name:"c", ctrl:true}).
+// Re-announce OSC 7/0 only when cwd actually changes, not on every repaint.
+let lastAnnouncedCwd: string | null = null;
+store.subscribe(() => {
+  const cwd = store.getState().cwd;
+  if (cwd !== lastAnnouncedCwd) {
+    lastAnnouncedCwd = cwd;
+    osc.announceDirectory(cwd);
+  }
+  requestRepaint();
+});
+
+store.load(initialDir).catch((err) => {
+  store.setMessage(`failed to load directory: ${errorMessage(err)}`, "error");
+});
+
+// ── input ──
 
 function quit(): void {
   input.stop();
@@ -181,11 +303,53 @@ function quit(): void {
 }
 
 input.onKey((key: Key) => {
-  if (key.name === "q" || (key.ctrl && key.name === "c")) {
-    quit();
-    return;
+  const action = resolveAction(key, store.getState());
+  if (!action) return;
+
+  switch (action.type) {
+    case "moveCursor":
+      store.moveCursor(action.delta);
+      break;
+    case "moveCursorTo":
+      store.moveCursorTo(action.pos);
+      break;
+    case "pageMove": {
+      const { listHeight } = computeLayout(screen.rows);
+      store.pageMove(action.direction, Math.max(listHeight, 1));
+      break;
+    }
+    case "enter":
+      store
+        .enter()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
+    case "up":
+      store.up().catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
+    case "toggleHidden":
+      store.toggleHidden();
+      break;
+    case "cycleSort":
+      store.cycleSort();
+      break;
+    case "toggleSortReverse":
+      store.toggleSortReverse();
+      break;
+    case "help":
+      // Full help overlay is Phase 9 (?, generated from the keymap table);
+      // this phase just confirms the key does something.
+      store.setMessage("help overlay not implemented yet");
+      break;
+    case "quit":
+      quit();
+      break;
+    case "closeOverlay":
+    case "clearMarks":
+    case "leaveArchive":
+      // Unreachable in Phase 2 — no overlays, marks, or archives exist yet.
+      // See keymap.ts's Escape precedence table.
+      break;
   }
-  requestRepaint();
 });
 
 input.onFocus(() => {

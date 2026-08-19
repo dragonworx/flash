@@ -314,6 +314,30 @@ export class Screen {
     return output;
   }
 
+  /**
+   * Render the back buffer as plain lines of text, one per row, with no
+   * escape sequences at all — not even the structural ones `flush()` always
+   * emits (cursor moves, the sync-output wrapper), and not gated by
+   * `--no-color` the way SGR is, because it never emits SGR in the first
+   * place. This is what `--dump-frame` uses: a snapshot that needs no TTY
+   * and diffs cleanly in a test file. Continuation cells contribute nothing
+   * (their glyph was already written by the wide cell before them); each
+   * line has its trailing spaces trimmed for a clean diff.
+   */
+  renderPlainText(): string {
+    const lines: string[] = [];
+    for (let y = 0; y < this.rows; y++) {
+      let line = "";
+      for (let x = 0; x < this.columns; x++) {
+        const cell = this.back[y * this.columns + x];
+        if (!cell || cell.ch === "") continue;
+        line += cell.ch;
+      }
+      lines.push(line.replace(/[ \t]+$/, ""));
+    }
+    return lines.join("\n");
+  }
+
   private copyBackToFront(): void {
     for (let i = 0; i < this.back.length; i++) {
       const b = this.back[i];

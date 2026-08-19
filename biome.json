@@ -13,7 +13,11 @@
     "indentWidth": 2
   },
   "files": {
-    "ignore": ["dist/", "node_modules/"]
+    "ignore": [
+      "dist/",
+      "node_modules/",
+      "tests/fixtures/"
+    ]
   },
   "overrides": [
     {
