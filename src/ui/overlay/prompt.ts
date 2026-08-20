@@ -287,7 +287,7 @@ export function renderPromptOverlay(
     screen.put(
       innerX,
       footerY,
-      pad("Enter to confirm · Esc to cancel", innerWidth),
+      pad("Enter confirm · Esc cancel · Ctrl+W/U word/clear", innerWidth),
       {
         fg: colors.dim,
       },

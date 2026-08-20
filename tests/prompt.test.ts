@@ -261,8 +261,9 @@ describe("renderPromptOverlay snapshot", () => {
     const text = lines.join("\n");
     expect(text).toContain("Rename");
     expect(text).toContain("report.txt");
-    expect(text).toContain("Enter to confirm");
-    expect(text).toContain("Esc to cancel");
+    expect(text).toContain("Enter confirm");
+    expect(text).toContain("Esc cancel");
+    expect(text).toContain("Ctrl+W/U word/clear");
   });
 
   it("renders an inline validation error", () => {
