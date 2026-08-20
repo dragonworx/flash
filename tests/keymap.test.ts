@@ -1,9 +1,11 @@
 // tests/keymap.test.ts — src/keymap.ts: the key -> action table, focused on
-// what Phase 4 added (Tab, Shift+↑/↓, Ctrl+A, c/x) and on Escape's
-// precedence table, which is the one binding whose meaning depends on
-// state. Everything here builds a plain `AppState` object directly rather
-// than driving a real `Store` through `load()` — `resolveAction` only ever
-// reads state, it never needs a live filesystem-backed store.
+// what Phase 4 added (Tab, Shift+↑/↓, Ctrl+A, c/x), on Escape's precedence
+// table (the one binding whose meaning depends on state), and, at the
+// bottom, Phase 7's overlay-capture routing — the mechanism that makes
+// "Enter does not confirm a delete" true. Everything here builds a plain
+// `AppState` object directly rather than driving a real `Store` through
+// `load()` — `resolveAction` only ever reads state, it never needs a live
+// filesystem-backed store.
 
 import { describe, expect, it } from "bun:test";
 import { DEFAULT_SORT } from "../src/fsapi/scan.ts";
@@ -136,5 +138,205 @@ describe("navigation bypass: ←/h/Backspace always go up", () => {
       type: "navigate",
       dir: "left",
     });
+  });
+});
+
+// ── Phase 7: rename/mkdir/delete/permissions ──
+
+describe("resolveAction: top-level Phase 7 bindings (no overlay open)", () => {
+  it("r/n/d/Delete/m map to the four startX actions", () => {
+    expect(resolveAction(makeKey({ name: "r" }), makeState())).toEqual({
+      type: "startRename",
+    });
+    expect(resolveAction(makeKey({ name: "n" }), makeState())).toEqual({
+      type: "startMkdir",
+    });
+    expect(resolveAction(makeKey({ name: "d" }), makeState())).toEqual({
+      type: "startDelete",
+    });
+    expect(resolveAction(makeKey({ name: "delete" }), makeState())).toEqual({
+      type: "startDelete",
+    });
+    expect(resolveAction(makeKey({ name: "m" }), makeState())).toEqual({
+      type: "startPermissions",
+    });
+  });
+});
+
+describe("resolveAction: prompt overlay captures input", () => {
+  const promptState = makeState({
+    overlay: {
+      kind: "prompt",
+      mode: "rename",
+      value: "old.txt",
+      cursor: 7,
+      error: null,
+      originalName: "old.txt",
+      originalPath: "/tmp/somewhere/old.txt",
+    },
+  });
+
+  it("types a letter that would otherwise be a global binding (e.g. 'r', 'q')", () => {
+    expect(resolveAction(makeKey({ name: "r" }), promptState)).toEqual({
+      type: "promptChar",
+      ch: "r",
+    });
+    expect(resolveAction(makeKey({ name: "q" }), promptState)).toEqual({
+      type: "promptChar",
+      ch: "q",
+    });
+  });
+
+  it("types a wide/CJK character verbatim", () => {
+    expect(resolveAction(makeKey({ name: "文" }), promptState)).toEqual({
+      type: "promptChar",
+      ch: "文",
+    });
+  });
+
+  it("routes editing keys to their prompt-specific actions", () => {
+    expect(resolveAction(makeKey({ name: "enter" }), promptState)).toEqual({
+      type: "promptSubmit",
+    });
+    expect(resolveAction(makeKey({ name: "backspace" }), promptState)).toEqual({
+      type: "promptBackspace",
+    });
+    expect(resolveAction(makeKey({ name: "delete" }), promptState)).toEqual({
+      type: "promptDeleteForward",
+    });
+    expect(resolveAction(makeKey({ name: "home" }), promptState)).toEqual({
+      type: "promptHome",
+    });
+    expect(resolveAction(makeKey({ name: "end" }), promptState)).toEqual({
+      type: "promptEnd",
+    });
+    expect(resolveAction(makeKey({ name: "left" }), promptState)).toEqual({
+      type: "promptLeft",
+    });
+    expect(resolveAction(makeKey({ name: "right" }), promptState)).toEqual({
+      type: "promptRight",
+    });
+    expect(resolveAction(makeKey({ name: "space" }), promptState)).toEqual({
+      type: "promptChar",
+      ch: " ",
+    });
+  });
+
+  it("Ctrl+W and Ctrl+U map to word-delete and clear-to-start", () => {
+    expect(
+      resolveAction(makeKey({ name: "w", ctrl: true }), promptState),
+    ).toEqual({ type: "promptWordDelete" });
+    expect(
+      resolveAction(makeKey({ name: "u", ctrl: true }), promptState),
+    ).toEqual({ type: "promptClearToStart" });
+  });
+
+  it("Escape closes the prompt via the ordinary Escape precedence, not a prompt-specific action", () => {
+    expect(resolveAction(makeKey({ name: "escape" }), promptState)).toEqual({
+      type: "closeOverlay",
+    });
+  });
+
+  it("swallows an arrow-key-adjacent function key rather than typing it", () => {
+    expect(resolveAction(makeKey({ name: "f5" }), promptState)).toBeNull();
+  });
+});
+
+describe("resolveAction: confirm overlay — Enter never accepts", () => {
+  const confirmState = makeState({
+    overlay: {
+      kind: "confirm",
+      message: "Delete 'a.txt'?",
+      paths: ["/tmp/somewhere/a.txt"],
+    },
+  });
+
+  it("only a literal y/Y confirms", () => {
+    expect(resolveAction(makeKey({ name: "y" }), confirmState)).toEqual({
+      type: "confirmYes",
+    });
+    expect(resolveAction(makeKey({ name: "Y" }), confirmState)).toEqual({
+      type: "confirmYes",
+    });
+  });
+
+  it("Enter does NOT confirm — the plan's named safety property", () => {
+    expect(resolveAction(makeKey({ name: "enter" }), confirmState)).toEqual({
+      type: "confirmCancel",
+    });
+  });
+
+  it("n and any other key cancel, same as Enter", () => {
+    expect(resolveAction(makeKey({ name: "n" }), confirmState)).toEqual({
+      type: "confirmCancel",
+    });
+    expect(resolveAction(makeKey({ name: "q" }), confirmState)).toEqual({
+      type: "confirmCancel",
+    });
+    expect(resolveAction(makeKey({ name: "space" }), confirmState)).toEqual({
+      type: "confirmCancel",
+    });
+  });
+
+  it("Escape closes it via the ordinary precedence table", () => {
+    expect(resolveAction(makeKey({ name: "escape" }), confirmState)).toEqual({
+      type: "closeOverlay",
+    });
+  });
+});
+
+describe("resolveAction: permissions overlay", () => {
+  const permState = makeState({
+    overlay: {
+      kind: "permissions",
+      paths: ["/tmp/somewhere/a.txt"],
+      rwxBits: 0o644,
+      specialBits: 0,
+      specialExplicit: false,
+      digitCount: 0,
+      focus: 0,
+      error: null,
+    },
+  });
+
+  it("Space toggles, arrows move focus, Enter applies", () => {
+    expect(resolveAction(makeKey({ name: "space" }), permState)).toEqual({
+      type: "permToggle",
+    });
+    expect(resolveAction(makeKey({ name: "up" }), permState)).toEqual({
+      type: "permMoveFocus",
+      dir: "up",
+    });
+    expect(resolveAction(makeKey({ name: "down" }), permState)).toEqual({
+      type: "permMoveFocus",
+      dir: "down",
+    });
+    expect(resolveAction(makeKey({ name: "left" }), permState)).toEqual({
+      type: "permMoveFocus",
+      dir: "left",
+    });
+    expect(resolveAction(makeKey({ name: "right" }), permState)).toEqual({
+      type: "permMoveFocus",
+      dir: "right",
+    });
+    expect(resolveAction(makeKey({ name: "enter" }), permState)).toEqual({
+      type: "permApply",
+    });
+  });
+
+  it("digit keys 0-7 map to permDigit", () => {
+    expect(resolveAction(makeKey({ name: "7" }), permState)).toEqual({
+      type: "permDigit",
+      digit: 7,
+    });
+    expect(resolveAction(makeKey({ name: "0" }), permState)).toEqual({
+      type: "permDigit",
+      digit: 0,
+    });
+  });
+
+  it("digit 8/9 (invalid octal) and plain letters are ignored", () => {
+    expect(resolveAction(makeKey({ name: "8" }), permState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "q" }), permState)).toBeNull();
   });
 });

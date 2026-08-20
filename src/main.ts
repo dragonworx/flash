@@ -62,6 +62,7 @@ import {
   renderListHeader,
   renderListView,
 } from "./ui/listView.ts";
+import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
 import { renderProgressOverlay } from "./ui/overlay/progress.ts";
 import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
 
@@ -377,6 +378,8 @@ function draw(screen: Screen): void {
       cursor: state.overlay.cursor,
       error: state.overlay.error,
     });
+  } else if (state.overlay?.kind === "confirm") {
+    renderConfirmOverlay(screen, w, h, state.overlay.message);
   }
 
   screen.flush();
@@ -644,6 +647,7 @@ input.onKey((key: Key) => {
       const overlay = store.getState().overlay;
       if (overlay?.kind === "progress") store.cancelOperation();
       else if (overlay?.kind === "prompt") store.cancelPrompt();
+      else if (overlay?.kind === "confirm") store.cancelDelete();
       break;
     }
     case "startRename":
@@ -685,17 +689,27 @@ input.onKey((key: Key) => {
         .catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
     case "startDelete":
-    case "startPermissions":
+      store
+        .startDelete()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
     case "confirmYes":
+      store
+        .confirmDelete()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
     case "confirmCancel":
+      store.cancelDelete();
+      break;
+    case "startPermissions":
     case "permMoveFocus":
     case "permToggle":
     case "permDigit":
     case "permApply":
-      // Wired in once ui/overlay/confirm.ts and ui/overlay/permissions.ts
-      // land (later in Phase 7) — the keymap table already routes their
-      // keys, per the same "declare the whole table up front" approach
-      // Phase 2 used for Escape's precedence arms.
+      // Wired in once ui/overlay/permissions.ts lands (the final part of
+      // Phase 7) — the keymap table already routes its keys, per the same
+      // "declare the whole table up front" approach Phase 2 used for
+      // Escape's precedence arms.
       break;
     case "leaveArchive":
       // Unreachable — no archives exist yet (Phase 8). See keymap.ts's
