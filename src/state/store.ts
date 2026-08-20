@@ -84,9 +84,10 @@
 // a stray keypress during an in-flight operation can't stack overlays.
 
 import { lstatSync } from "node:fs";
-import { chmod, rename as fsRename, lstat } from "node:fs/promises";
+import { rename as fsRename, lstat } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import type { Entry } from "../fsapi/entry.ts";
+import { chmodPreserving } from "../fsapi/ops/chmod.ts";
 import { countTree, mkdir } from "../fsapi/ops/index.ts";
 import type {
   CutOutcome,
@@ -1087,8 +1088,14 @@ export class Store {
         return;
       }
       this.state.overlay = null;
-      this.setMessage(`created '${name}'`);
+      // refresh() before setMessage(): refresh() can set its own "N marks
+      // dropped" message when a rescan prunes a stale mark, which would
+      // otherwise silently clobber this method's own outcome message —
+      // setMessage() always overwrites, there's no queueing. Calling
+      // refresh() first means whichever message actually matters most (this
+      // one) is the one left on screen.
       await this.refresh(this.state.cwd);
+      this.setMessage(`created '${name}'`);
       return;
     }
 
@@ -1119,8 +1126,9 @@ export class Store {
       return;
     }
     this.state.overlay = null;
-    this.setMessage(`renamed to '${name}'`);
+    // See the mkdir branch above for why refresh() runs before setMessage().
     await this.refresh(this.state.cwd);
+    this.setMessage(`renamed to '${name}'`);
   }
 
   // ── delete (Phase 7) ──
@@ -1253,8 +1261,15 @@ export class Store {
 
     this.state.overlay = null;
     for (const p of outcome.deletedSources) this.state.marked.delete(p);
-    this.reportDeleteOutcome(outcome);
+    // refresh() before reportDeleteOutcome(): refresh() can set its own "N
+    // marks dropped" message when the rescan prunes a stale mark, which
+    // would otherwise silently clobber this method's own outcome message —
+    // setMessage() always overwrites, there's no queueing. Calling
+    // refresh() first means the delete's own outcome is what's left on
+    // screen (submitPrompt's mkdir/rename branches do the same thing, for
+    // the same reason).
     await this.refresh(this.state.cwd);
+    this.reportDeleteOutcome(outcome);
   }
 
   /**
@@ -1365,11 +1380,21 @@ export class Store {
    * real `chmod` semantics). `specialExplicit` flips true once that 4th
    * digit lands, which is what tells `applyPermissions` to use the typed
    * `specialBits` on every target instead of preserving each one's own.
+   *
+   * The very first digit of a session starts the accumulator at 0, not at
+   * whatever the grid currently shows — digit entry means "I am typing an
+   * absolute octal value," so it must not be contaminated by the seed
+   * file's mode or by whatever Space-toggling happened before the first
+   * digit. `digitCount === 0` is exactly "no digit typed yet" (Space never
+   * touches it), so that is the reset signal.
    */
   permDigit(digit: number): void {
     const overlay = this.state.overlay;
     if (!overlay || overlay.kind !== "permissions") return;
-    const current = (overlay.specialBits << 9) | overlay.rwxBits;
+    const current =
+      overlay.digitCount === 0
+        ? 0
+        : (overlay.specialBits << 9) | overlay.rwxBits;
     const next = ((current << 3) | (digit & 0o7)) & 0o7777;
     overlay.rwxBits = next & 0o777;
     overlay.specialBits = (next >> 9) & 0o7;
@@ -1417,7 +1442,10 @@ export class Store {
         const newMode = specialExplicit
           ? (st.mode & ~0o7777) | (specialBits << 9) | rwxBits
           : (st.mode & ~0o777) | rwxBits;
-        await chmod(path, newMode);
+        // chmodPreserving, not fs.promises.chmod — see fsapi/ops/chmod.ts's
+        // file header: Bun's own chmod silently masks away the special
+        // bits this method just went to the trouble of preserving above.
+        await chmodPreserving(path, newMode);
         succeeded++;
       } catch (chmodErr) {
         failures.push(`${basename(path)}: ${errorMessage(chmodErr)}`);
@@ -1434,11 +1462,14 @@ export class Store {
     if (failures.length > 0) {
       parts.push(`${failures.length} failed`);
     }
+    // refresh() before setMessage() — see submitPrompt's mkdir branch for
+    // why: refresh() can set its own "N marks dropped" message, which would
+    // otherwise silently clobber this method's own outcome message.
+    await this.refresh(this.state.cwd);
     this.setMessage(
       parts.length > 0 ? parts.join(", ") : "nothing changed",
       failures.length > 0 ? "error" : "info",
     );
-    await this.refresh(this.state.cwd);
   }
 
   // ── messages ──

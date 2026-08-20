@@ -23,7 +23,7 @@ import {
   realpathSync,
   statSync,
 } from "node:fs";
-import { resolve } from "node:path";
+import { basename, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import pkg from "../package.json" with { type: "json" };
 import {
@@ -63,6 +63,7 @@ import {
   renderListView,
 } from "./ui/listView.ts";
 import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
+import { renderPermissionsOverlay } from "./ui/overlay/permissions.ts";
 import { renderProgressOverlay } from "./ui/overlay/progress.ts";
 import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
 
@@ -380,6 +381,18 @@ function draw(screen: Screen): void {
     });
   } else if (state.overlay?.kind === "confirm") {
     renderConfirmOverlay(screen, w, h, state.overlay.message);
+  } else if (state.overlay?.kind === "permissions") {
+    const paths = state.overlay.paths;
+    const targetLabel =
+      paths.length === 1 ? basename(paths[0] ?? "") : `${paths.length} items`;
+    renderPermissionsOverlay(screen, w, h, {
+      targetLabel,
+      rwxBits: state.overlay.rwxBits,
+      specialBits: state.overlay.specialBits,
+      specialExplicit: state.overlay.specialExplicit,
+      focus: state.overlay.focus,
+      error: state.overlay.error,
+    });
   }
 
   screen.flush();
@@ -648,6 +661,7 @@ input.onKey((key: Key) => {
       if (overlay?.kind === "progress") store.cancelOperation();
       else if (overlay?.kind === "prompt") store.cancelPrompt();
       else if (overlay?.kind === "confirm") store.cancelDelete();
+      else if (overlay?.kind === "permissions") store.cancelPermissions();
       break;
     }
     case "startRename":
@@ -702,14 +716,21 @@ input.onKey((key: Key) => {
       store.cancelDelete();
       break;
     case "startPermissions":
+      store.startPermissions();
+      break;
     case "permMoveFocus":
+      store.permMoveFocus(action.dir);
+      break;
     case "permToggle":
+      store.permToggle();
+      break;
     case "permDigit":
+      store.permDigit(action.digit);
+      break;
     case "permApply":
-      // Wired in once ui/overlay/permissions.ts lands (the final part of
-      // Phase 7) — the keymap table already routes its keys, per the same
-      // "declare the whole table up front" approach Phase 2 used for
-      // Escape's precedence arms.
+      store
+        .applyPermissions()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
     case "leaveArchive":
       // Unreachable — no archives exist yet (Phase 8). See keymap.ts's
