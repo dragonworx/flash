@@ -112,6 +112,27 @@ chmodPreserving(7755)        -> 7755
 external /usr/bin/stat       -> 7755
 ```
 
+The first version of that workaround had a hole worth recording, because it is the
+shape of mistake this whole bug invites. When `dlopen` failed it fell straight back
+to `fs.promises.chmod` — silently reintroducing the defect. That was not a
+theoretical path: the libc soname is guessed, and `libc.so.6` does not exist on
+musl, so every Bun build on Alpine would have taken it.
+
+The fix is to stop trying to predict *why* the fast path might be unavailable.
+When special bits are actually requested, the result is read back from disk; if
+they did not stick, it escalates to `/bin/chmod`, and if that also fails it throws
+rather than reporting a success that did not happen. Confirmed inside a compiled
+binary with FFI forcibly disabled:
+
+```console
+compiled binary, FFI disabled -> 4755
+external stat confirms        -> 4755
+```
+
+`tests/chmod-fallback.test.ts` covers the degraded paths through a test seam, since
+they are otherwise unreachable on a glibc machine. Four of its six tests fail if
+the verification step is removed.
+
 ---
 
 ## 3. `Bun.build()`'s `banner` does not replace an entrypoint's shebang
