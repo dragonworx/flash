@@ -50,6 +50,11 @@ export type Action =
   | { type: "toggleSortReverse" }
   | { type: "help" }
   | { type: "quit" }
+  // Phase 9: the `?` help overlay. `helpScroll` is only ever emitted while
+  // `state.overlay?.kind === "help"` (see `resolveHelpKey` below) — `delta`
+  // is a line count, with Home/End sending an oversized delta that
+  // `Store.helpScroll`'s clamp reduces to "jump to the very top/bottom."
+  | { type: "helpScroll"; delta: number }
   // Phase 4: selection and clipboard. `toggleMark` also advances the
   // cursor (see state/store.ts's `MARK_ADVANCE`); `extendSelection` carries
   // the arrow direction so the Shift+↑/↓ range anchor extends the right way.
@@ -115,6 +120,308 @@ export type Action =
   | { type: "permToggle" }
   | { type: "permDigit"; digit: number }
   | { type: "permApply" };
+
+// ── the bindings table ──
+//
+// Single source of truth for every plain (non-overlay, non-Escape) key
+// binding: a human-readable label, a one-line description, a category, and
+// — via `matches`/`action` — what `resolveAction`'s final fallback actually
+// dispatches to. That fallback (at the bottom of this file) does nothing
+// but scan this array and return the first match; `ui/overlay/help.ts`
+// renders the very same array grouped by `category`. There is exactly one
+// list, so the `?` help screen cannot silently drift from what a key
+// actually does: a binding that isn't added here doesn't work, and one
+// added here without a `description` fails `tsc` (the field is required),
+// which is what tests/help.test.ts leans on to fail loudly if a future
+// binding forgets one.
+//
+// Escape and the three overlay-capture resolvers just below
+// (`resolvePromptKey`/`resolveConfirmKey`/`resolvePermissionsKey`, joined
+// by `resolveHelpKey`) are deliberately NOT folded into this table — each
+// is already its own single source of truth for a state-dependent or
+// modal-only slice of the key surface (Escape's precedence table; a
+// prompt's line editor; etc.), so folding them in would just be drift risk
+// in the other direction. `ui/overlay/help.ts` documents Escape by hand
+// (`ESCAPE_HELP` below) for exactly this reason.
+export type BindingCategory =
+  | "navigation"
+  | "selection"
+  | "file operations"
+  | "archives"
+  | "view"
+  | "app";
+
+export type KeyBinding = {
+  /** Human-readable key labels, in the order shown in the help overlay. */
+  display: string[];
+  description: string;
+  category: BindingCategory;
+  matches: (key: Key) => boolean;
+  action: (key: Key) => Action;
+};
+
+/** A key with this `name`, and neither modifier held — most of the table. */
+function bare(...names: string[]): (key: Key) => boolean {
+  return (key: Key) => !key.ctrl && !key.alt && names.includes(key.name);
+}
+
+/** An arrow key specifically *without* Shift — Shift+↑/↓ is its own entry. */
+function plainArrow(name: string): (key: Key) => boolean {
+  return (key: Key) => !key.ctrl && !key.alt && !key.shift && key.name === name;
+}
+
+function withCtrl(name: string): (key: Key) => boolean {
+  return (key: Key) => key.ctrl && !key.alt && key.name === name;
+}
+
+function shiftArrow(name: "up" | "down"): (key: Key) => boolean {
+  return (key: Key) => key.shift && key.name === name;
+}
+
+export const BINDINGS: KeyBinding[] = [
+  // ── selection ── (checked ahead of the plain arrow entries below so a
+  // Shift+↑/↓ can never fall through to the bare "move cursor" binding)
+  {
+    display: ["Shift+↑", "Shift+↓"],
+    description: "Extend the marked range from the cursor",
+    category: "selection",
+    matches: (key) => shiftArrow("up")(key) || shiftArrow("down")(key),
+    action: (key) => ({
+      type: "extendSelection",
+      dir: key.name === "up" ? "up" : "down",
+    }),
+  },
+  {
+    display: ["Ctrl+A"],
+    description: "Mark every entry in the current directory",
+    category: "selection",
+    matches: withCtrl("a"),
+    action: () => ({ type: "markAll" }),
+  },
+  {
+    display: ["Tab"],
+    description: "Toggle the mark on the entry under the cursor",
+    category: "selection",
+    matches: bare("tab"),
+    action: () => ({ type: "toggleMark" }),
+  },
+
+  // ── navigation ──
+  {
+    display: ["↑"],
+    description: "Move up (list) · move up a row (grid)",
+    category: "navigation",
+    matches: plainArrow("up"),
+    action: () => ({ type: "navigate", dir: "up" }),
+  },
+  {
+    display: ["↓"],
+    description: "Move down (list) · move down a row (grid)",
+    category: "navigation",
+    matches: plainArrow("down"),
+    action: () => ({ type: "navigate", dir: "down" }),
+  },
+  {
+    display: ["←"],
+    description: "Go up a directory (list) · move left (grid)",
+    category: "navigation",
+    matches: plainArrow("left"),
+    action: () => ({ type: "navigate", dir: "left" }),
+  },
+  {
+    display: ["→"],
+    description: "Open (list) · move right (grid)",
+    category: "navigation",
+    matches: plainArrow("right"),
+    action: () => ({ type: "navigate", dir: "right" }),
+  },
+  {
+    display: ["k"],
+    description: "Move cursor up",
+    category: "navigation",
+    matches: bare("k"),
+    action: () => ({ type: "moveCursor", delta: -1 }),
+  },
+  {
+    display: ["j"],
+    description: "Move cursor down",
+    category: "navigation",
+    matches: bare("j"),
+    action: () => ({ type: "moveCursor", delta: 1 }),
+  },
+  {
+    display: ["Enter", "Space", "l"],
+    description: "Open the selected entry (enter dir / view file)",
+    category: "navigation",
+    matches: bare("enter", "space", "l"),
+    action: () => ({ type: "enter" }),
+  },
+  {
+    display: ["h", "Backspace"],
+    description: "Go up a directory, regardless of view",
+    category: "navigation",
+    matches: bare("h", "backspace"),
+    action: () => ({ type: "up" }),
+  },
+  {
+    display: ["PgUp"],
+    description: "Page up",
+    category: "navigation",
+    matches: bare("pageup"),
+    action: () => ({ type: "pageMove", direction: "up" }),
+  },
+  {
+    display: ["PgDn"],
+    description: "Page down",
+    category: "navigation",
+    matches: bare("pagedown"),
+    action: () => ({ type: "pageMove", direction: "down" }),
+  },
+  {
+    display: ["Home"],
+    description: "Jump to the first entry",
+    category: "navigation",
+    matches: bare("home"),
+    action: () => ({ type: "moveCursorTo", pos: "home" }),
+  },
+  {
+    display: ["End"],
+    description: "Jump to the last entry",
+    category: "navigation",
+    matches: bare("end"),
+    action: () => ({ type: "moveCursorTo", pos: "end" }),
+  },
+
+  // ── file operations ──
+  {
+    display: ["c"],
+    description: "Copy marked entries (or the entry under the cursor)",
+    category: "file operations",
+    matches: bare("c"),
+    action: () => ({ type: "copy" }),
+  },
+  {
+    display: ["x"],
+    description: "Cut marked entries (or the entry under the cursor)",
+    category: "file operations",
+    matches: bare("x"),
+    action: () => ({ type: "cut" }),
+  },
+  {
+    display: ["p"],
+    description: "Paste the clipboard into the current directory",
+    category: "file operations",
+    matches: bare("p"),
+    action: () => ({ type: "paste" }),
+  },
+  {
+    display: ["r"],
+    description: "Rename the entry under the cursor",
+    category: "file operations",
+    matches: bare("r"),
+    action: () => ({ type: "startRename" }),
+  },
+  {
+    display: ["n"],
+    description: "Create a new directory",
+    category: "file operations",
+    matches: bare("n"),
+    action: () => ({ type: "startMkdir" }),
+  },
+  {
+    display: ["d", "Delete"],
+    description: "Delete marked entries (or the entry under the cursor)",
+    category: "file operations",
+    matches: bare("d", "delete"),
+    action: () => ({ type: "startDelete" }),
+  },
+  {
+    display: ["m"],
+    description: "Edit permissions (chmod)",
+    category: "file operations",
+    matches: bare("m"),
+    action: () => ({ type: "startPermissions" }),
+  },
+
+  // ── archives ──
+  {
+    display: ["z"],
+    description: "Zip marked entries (or the cursor entry) into a new archive",
+    category: "archives",
+    matches: bare("z"),
+    action: () => ({ type: "startArchive" }),
+  },
+  {
+    display: ["u"],
+    description: "Extract the archive under the cursor here",
+    category: "archives",
+    matches: bare("u"),
+    action: () => ({ type: "startExtract" }),
+  },
+
+  // ── view ──
+  {
+    display: ["v"],
+    description: "Toggle list/grid view",
+    category: "view",
+    matches: bare("v"),
+    action: () => ({ type: "toggleView" }),
+  },
+  {
+    display: ["."],
+    description: "Toggle hidden files",
+    category: "view",
+    matches: bare("."),
+    action: () => ({ type: "toggleHidden" }),
+  },
+  {
+    display: ["s"],
+    description: "Cycle sort order (name / size / mtime / extension)",
+    category: "view",
+    matches: bare("s"),
+    action: () => ({ type: "cycleSort" }),
+  },
+  {
+    display: ["S"],
+    description: "Reverse the sort order",
+    category: "view",
+    matches: bare("S"),
+    action: () => ({ type: "toggleSortReverse" }),
+  },
+
+  // ── app ──
+  {
+    display: ["?"],
+    description: "Show this help",
+    category: "app",
+    matches: bare("?"),
+    action: () => ({ type: "help" }),
+  },
+  {
+    display: ["q", "Ctrl+C"],
+    description: "Quit flash",
+    category: "app",
+    matches: (key) => bare("q")(key) || withCtrl("c")(key),
+    action: () => ({ type: "quit" }),
+  },
+];
+
+/**
+ * Escape isn't in `BINDINGS` above (see that array's file comment) — its
+ * dispatch lives entirely in `ESCAPE_PRECEDENCE`/`resolveEscape` below,
+ * which is already its own single source of truth. This is just the
+ * human-readable description `ui/overlay/help.ts` renders alongside it, in
+ * the "navigation" category.
+ */
+export const ESCAPE_HELP: {
+  display: string[];
+  description: string;
+  category: BindingCategory;
+} = {
+  display: ["Esc"],
+  description: "Close overlay > clear marks > leave archive > go up",
+  category: "navigation",
+};
 
 // ── Escape precedence ──
 
@@ -242,94 +549,62 @@ function resolvePermissionsKey(key: Key): Action | null {
   }
 }
 
-// ── the rest of the bindings ──
+// A scroll step big enough that clamping it against any real content length
+// is equivalent to "jump to the very top/bottom" — Home/End reuse the same
+// `helpScroll` action as ↑/↓/j/k/PgUp/PgDn rather than needing their own
+// Action variant, since `Store.helpScroll`'s clamp (see state/store.ts)
+// already has to saturate at both ends for the plain scroll keys anyway.
+const HELP_SCROLL_JUMP = 1_000_000;
+
+/**
+ * The `?` help overlay captures every key except Escape (handled
+ * unconditionally before this ever runs, same as every other overlay) —
+ * scrolling keys move it, `?` toggles it closed again (a help screen that
+ * only Escape can dismiss is a common enough paper cut to avoid for free),
+ * and everything else is swallowed rather than leaking through to
+ * copy/cut/delete/etc. running behind it.
+ */
+function resolveHelpKey(key: Key): Action | null {
+  if (key.ctrl || key.alt) return null;
+  switch (key.name) {
+    case "up":
+    case "k":
+      return { type: "helpScroll", delta: -1 };
+    case "down":
+    case "j":
+      return { type: "helpScroll", delta: 1 };
+    case "pageup":
+      return { type: "helpScroll", delta: -10 };
+    case "pagedown":
+      return { type: "helpScroll", delta: 10 };
+    case "home":
+      return { type: "helpScroll", delta: -HELP_SCROLL_JUMP };
+    case "end":
+      return { type: "helpScroll", delta: HELP_SCROLL_JUMP };
+    case "?":
+      return { type: "closeOverlay" };
+    default:
+      return null;
+  }
+}
+
+// ── the rest of the bindings: driven entirely by `BINDINGS` above ──
 
 /**
  * Map one keypress to an action, or `null` when the key means nothing right
  * now. `state` is consulted for Escape's precedence table above and for
- * which overlay (if any) is open — every other binding is a static lookup.
+ * which overlay (if any) is open — every other binding is a lookup into
+ * `BINDINGS`, scanned in order for the first entry whose `matches` accepts
+ * this key.
  */
 export function resolveAction(key: Key, state: AppState): Action | null {
   if (key.name === "escape") return resolveEscape(state);
   if (state.overlay?.kind === "prompt") return resolvePromptKey(key);
   if (state.overlay?.kind === "confirm") return resolveConfirmKey(key);
   if (state.overlay?.kind === "permissions") return resolvePermissionsKey(key);
-  if (key.ctrl && key.name === "c") return { type: "quit" };
-  if (key.ctrl && key.name === "a") return { type: "markAll" };
-  // Shift+↑/↓ extends the range selection — checked ahead of the ctrl/alt
-  // early-return below (shift is its own flag, unrelated to it) and ahead
-  // of the plain arrow-key cases, which a bare ↑/↓ still falls through to.
-  if (key.shift && (key.name === "up" || key.name === "down")) {
-    return { type: "extendSelection", dir: key.name };
+  if (state.overlay?.kind === "help") return resolveHelpKey(key);
+  for (const binding of BINDINGS) {
+    if (binding.matches(key)) return binding.action(key);
   }
-  if (key.ctrl || key.alt) return null;
-
-  switch (key.name) {
-    // The literal arrow keys are view-aware (see the `navigate` Action
-    // comment above) — only they change meaning in grid mode. The vi
-    // letters keep their plain list-style meaning in every view, so there
-    // is always a fixed, predictable set of bindings regardless of view.
-    case "up":
-      return { type: "navigate", dir: "up" };
-    case "down":
-      return { type: "navigate", dir: "down" };
-    case "left":
-      return { type: "navigate", dir: "left" };
-    case "right":
-      return { type: "navigate", dir: "right" };
-    case "k":
-      return { type: "moveCursor", delta: -1 };
-    case "j":
-      return { type: "moveCursor", delta: 1 };
-    case "pageup":
-      return { type: "pageMove", direction: "up" };
-    case "pagedown":
-      return { type: "pageMove", direction: "down" };
-    case "home":
-      return { type: "moveCursorTo", pos: "home" };
-    case "end":
-      return { type: "moveCursorTo", pos: "end" };
-    case "enter":
-    case "space":
-    case "l":
-      return { type: "enter" };
-    case "h":
-    case "backspace":
-      return { type: "up" };
-    case "tab":
-      return { type: "toggleMark" };
-    case "c":
-      return { type: "copy" };
-    case "x":
-      return { type: "cut" };
-    case "p":
-      return { type: "paste" };
-    case "r":
-      return { type: "startRename" };
-    case "n":
-      return { type: "startMkdir" };
-    case "d":
-    case "delete":
-      return { type: "startDelete" };
-    case "m":
-      return { type: "startPermissions" };
-    case "z":
-      return { type: "startArchive" };
-    case "u":
-      return { type: "startExtract" };
-    case "v":
-      return { type: "toggleView" };
-    case ".":
-      return { type: "toggleHidden" };
-    case "s":
-      return { type: "cycleSort" };
-    case "S":
-      return { type: "toggleSortReverse" };
-    case "?":
-      return { type: "help" };
-    case "q":
-      return { type: "quit" };
-    default:
-      return null;
-  }
+  return null;
 }

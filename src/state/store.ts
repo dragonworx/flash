@@ -142,16 +142,21 @@ export type ViewMode = "list" | "grid";
 export type Message = { text: string; kind: "info" | "error" };
 
 /**
- * `"help"` is still a stub (Phase 7) — `store.setMessage` covers the `?`
- * key for now, nothing ever sets `overlay` to it. `"progress"` is real as
- * of Phase 5a: `paste()` below sets it for the duration of a copy and the
- * render loop (main.ts's `draw()`) paints it via
- * `ui/overlay/progress.ts`. Its shape matches `CopyProgress` from
- * `fsapi/ops/copy.ts` field-for-field (plus `label`) so `paste()` can
- * spread a progress event straight onto it with no translation layer.
+ * `"help"` (Phase 9): `startHelp()`/`closeHelp()`/`helpScroll()` below own
+ * it. `scrollOffset` is a line count into `ui/overlay/help.ts`'s generated,
+ * flattened `HELP_LINES` — it lives on the overlay object rather than as a
+ * bare local in main.ts (the way the grid view's scroll offset does)
+ * because, like the permissions overlay's `focus` field, it's directly
+ * user-driven by its own dedicated keys rather than derived every frame
+ * from the cursor. `"progress"` is real as of Phase 5a: `paste()` below
+ * sets it for the duration of a copy and the render loop (main.ts's
+ * `draw()`) paints it via `ui/overlay/progress.ts`. Its shape matches
+ * `CopyProgress` from `fsapi/ops/copy.ts` field-for-field (plus `label`) so
+ * `paste()` can spread a progress event straight onto it with no
+ * translation layer.
  */
 export type Overlay =
-  | { kind: "help" }
+  | { kind: "help"; scrollOffset: number }
   | {
       kind: "progress";
       label: string;
@@ -1895,6 +1900,47 @@ export class Store {
       parts.length > 0 ? parts.join(", ") : "nothing changed",
       failures.length > 0 ? "error" : "info",
     );
+  }
+
+  // ── help (Phase 9) ──
+
+  /**
+   * `?`: open the generated help overlay. Same already-open guard as
+   * `startRename`/`startMkdir`/`startDelete`/`startPermissions` — but,
+   * unlike those, not gated by `refuseInsideArchive()`: the key reference is
+   * exactly as useful while browsing a zip as anywhere else.
+   */
+  startHelp(): void {
+    if (this.state.overlay) return;
+    this.state.overlay = { kind: "help", scrollOffset: 0 };
+    this.notify();
+  }
+
+  /** Esc, or `?` again (see keymap.ts's `resolveHelpKey`): dismiss it. */
+  closeHelp(): void {
+    if (this.state.overlay?.kind !== "help") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  /**
+   * Move the help overlay's scroll position by `delta` lines, clamped to
+   * `[0, maxScrollOffset]`. `maxScrollOffset` is computed by the caller
+   * (main.ts, via `ui/overlay/help.ts`'s `maxHelpScroll`) from the terminal
+   * size and the generated content's line count — the same
+   * runtime-geometry-computed-by-the-caller pattern `pageMove` already uses
+   * for `frame.listHeight`, and for the same reason: this file has no
+   * access to the terminal width/height `Screen` was constructed with.
+   */
+  helpScroll(delta: number, maxScrollOffset: number): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "help") return;
+    const clampedMax = Math.max(0, maxScrollOffset);
+    overlay.scrollOffset = Math.max(
+      0,
+      Math.min(overlay.scrollOffset + delta, clampedMax),
+    );
+    this.notify();
   }
 
   // ── messages ──

@@ -63,6 +63,7 @@ import {
   renderListView,
 } from "./ui/listView.ts";
 import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
+import { maxHelpScroll, renderHelpOverlay } from "./ui/overlay/help.ts";
 import { renderPermissionsOverlay } from "./ui/overlay/permissions.ts";
 import { renderProgressOverlay } from "./ui/overlay/progress.ts";
 import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
@@ -404,6 +405,8 @@ function draw(screen: Screen): void {
       focus: state.overlay.focus,
       error: state.overlay.error,
     });
+  } else if (state.overlay?.kind === "help") {
+    renderHelpOverlay(screen, w, h, state.overlay.scrollOffset);
   }
 
   screen.flush();
@@ -642,9 +645,13 @@ input.onKey((key: Key) => {
       persistConfig();
       break;
     case "help":
-      // Full help overlay is Phase 9 (?, generated from the keymap table);
-      // this phase just confirms the key does something.
-      store.setMessage("help overlay not implemented yet");
+      store.startHelp();
+      break;
+    case "helpScroll":
+      store.helpScroll(
+        action.delta,
+        maxHelpScroll(Math.max(screen.columns, 1), Math.max(screen.rows, 1)),
+      );
       break;
     case "quit":
       quit();
@@ -682,6 +689,7 @@ input.onKey((key: Key) => {
       else if (overlay?.kind === "prompt") store.cancelPrompt();
       else if (overlay?.kind === "confirm") store.cancelDelete();
       else if (overlay?.kind === "permissions") store.cancelPermissions();
+      else if (overlay?.kind === "help") store.closeHelp();
       break;
     }
     case "startRename":
