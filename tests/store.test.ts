@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
@@ -363,5 +364,85 @@ describe("Store clipboard (copy/cut)", () => {
     store.moveCursorTo("home"); // the ".." row
     store.copy();
     expect(store.getState().clipboard).toBeNull();
+  });
+});
+
+// ── Phase 5a: paste ──
+//
+// A separate destination directory per test (a fresh mkdtemp under
+// `pasteRoot`) rather than sharing `selRoot`, since paste actually writes
+// to disk and each test wants a clean destination to assert against.
+
+describe("Store.paste", () => {
+  it("copies the clipboard into the current directory and clears the clipboard", async () => {
+    const dest = mkdtempSync(join(tmpdir(), "flash-store-paste-dest-"));
+    try {
+      const store = await makeSelStore();
+      store.setCursorIndex(indexOf(store, "f1.txt"));
+      store.copy();
+      const clipboard = store.getState().clipboard;
+      expect(clipboard).not.toBeNull();
+
+      // Simulate navigating to `dest` without a real directory rescan
+      // dependency: load() is the same path `enter()`/`up()` use.
+      await store.load(dest);
+      await store.paste();
+
+      expect(existsSync(join(dest, "f1.txt"))).toBe(true);
+      expect(store.getState().clipboard).toBeNull();
+      expect(store.getState().overlay).toBeNull();
+      expect(store.getState().message?.kind).toBe("info");
+    } finally {
+      rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  it("shows a 'not yet implemented' message for a cut clipboard and touches no disk", async () => {
+    const dest = mkdtempSync(join(tmpdir(), "flash-store-paste-dest-"));
+    try {
+      const store = await makeSelStore();
+      store.setCursorIndex(indexOf(store, "f2.txt"));
+      store.cut();
+      await store.load(dest);
+      await store.paste();
+
+      expect(readdirSync(dest)).toEqual([]);
+      // The clipboard stays staged — nothing dangerous happened, so there's
+      // nothing to discard.
+      expect(store.getState().clipboard?.mode).toBe("cut");
+      expect(store.getState().message?.text).toContain("not yet implemented");
+    } finally {
+      rmSync(dest, { recursive: true, force: true });
+    }
+  });
+
+  it("reports and clears the clipboard when every staged path has vanished", async () => {
+    const dest = mkdtempSync(join(tmpdir(), "flash-store-paste-dest-"));
+    const gone = mkdtempSync(join(tmpdir(), "flash-store-paste-gone-"));
+    const goneFile = join(gone, "vanished.txt");
+    writeFileSync(goneFile, "x");
+    try {
+      const store = await makeSelStore();
+      await store.load(gone);
+      store.setCursorIndex(1); // the only real entry
+      store.copy();
+      rmSync(goneFile); // vanish it before paste runs
+
+      await store.load(dest);
+      await store.paste();
+
+      expect(store.getState().clipboard).toBeNull();
+      expect(readdirSync(dest)).toEqual([]);
+      expect(store.getState().message?.kind).toBe("error");
+    } finally {
+      rmSync(dest, { recursive: true, force: true });
+      rmSync(gone, { recursive: true, force: true });
+    }
+  });
+
+  it("does nothing and reports an empty clipboard", async () => {
+    const store = await makeSelStore();
+    await store.paste();
+    expect(store.getState().message?.text).toBe("clipboard is empty");
   });
 });

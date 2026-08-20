@@ -27,10 +27,28 @@
 // anchor is *not* on `AppState` — like `history` above, it is private
 // bookkeeping the renderers never need (see `rangeAnchor`/`rangeLastBounds`
 // below and `extendSelection()`).
+//
+// Phase 5a (paste) is the first thing in this file that touches disk.
+// `paste()` is deliberately the only place `fsapi/ops/queue.ts` is called
+// from — same shape as `load()`/`enter()`/`up()` above: an async Store
+// method that awaits the fs work itself and calls `notify()` when state
+// changes, rather than main.ts reaching into fsapi directly. `pasteAbort`
+// is bookkeeping in the same spirit as `history`/`rangeAnchor`: not part of
+// `AppState`, because the renderer only ever needs the plain progress
+// numbers on `state.overlay`, never the controller that produced them.
+//
+// Clipboard staleness (a path that vanished between copy/cut and paste) is
+// handled here, not in ops/queue.ts: vanished paths are filtered out before
+// the job is ever queued, and the count of how many were skipped is folded
+// into the summary message — the plan leaves this open and recommends
+// exactly this over failing the whole paste.
 
 import { lstatSync } from "node:fs";
+import { lstat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { Entry } from "../fsapi/entry.ts";
+import type { PasteOutcome } from "../fsapi/ops/queue.ts";
+import { runPasteJob } from "../fsapi/ops/queue.ts";
 import {
   DEFAULT_SORT,
   SORT_KEYS,
@@ -48,12 +66,25 @@ export type ViewMode = "list" | "grid";
 export type Message = { text: string; kind: "info" | "error" };
 
 /**
- * No overlay exists yet in Phase 2 — this is a stub so `AppState.overlay`
- * has a real (if empty) type, and so Phase 4/7's confirm/prompt/permissions
- * overlays and the Escape precedence table in keymap.ts have somewhere to
- * slot in without changing this file's shape.
+ * `"help"` is still a stub (Phase 7) — `store.setMessage` covers the `?`
+ * key for now, nothing ever sets `overlay` to it. `"progress"` is real as
+ * of Phase 5a: `paste()` below sets it for the duration of a copy and the
+ * render loop (main.ts's `draw()`) paints it via
+ * `ui/overlay/progress.ts`. Its shape matches `CopyProgress` from
+ * `fsapi/ops/copy.ts` field-for-field (plus `label`) so `paste()` can
+ * spread a progress event straight onto it with no translation layer.
  */
-export type Overlay = { kind: "help" };
+export type Overlay =
+  | { kind: "help" }
+  | {
+      kind: "progress";
+      label: string;
+      done: number;
+      total: number;
+      currentPath: string;
+      bytesDone: number;
+      bytesTotal: number;
+    };
 
 export type AppState = {
   cwd: string;
@@ -101,6 +132,11 @@ export class Store {
   // whatever fell out of range without touching marks Tab put there.
   private rangeAnchor: number | null = null;
   private rangeLastBounds: [number, number] | null = null;
+  // The in-flight paste's AbortController, if any (Phase 5a). `cancelPaste`
+  // aborts it; `paste` clears it in a `finally` so a signal from a
+  // superseded call can never be mistaken for the current one — see the
+  // `pasteAbort !== abort` check in `paste()`'s onProgress callback.
+  private pasteAbort: AbortController | null = null;
 
   constructor(init: StoreInit) {
     this.state = {
@@ -495,6 +531,125 @@ export class Store {
     return [entry.path];
   }
 
+  // ── paste (Phase 5a) ──
+
+  /**
+   * Consume `state.clipboard` and copy its paths into the current
+   * directory. Only `mode: "copy"` executes this phase — a `mode: "cut"`
+   * clipboard shows a "not yet implemented" message and touches nothing on
+   * disk, per the plan (Phase 5b implements move/cut-execution). Vanished
+   * clipboard paths are filtered out before queueing and reported by count
+   * rather than failing the whole paste (see the file header). Clears the
+   * clipboard only once at least one source actually landed and the job
+   * was not cancelled — a fully-rejected or fully-cancelled paste leaves
+   * the clipboard staged so the user can fix whatever was wrong and retry.
+   */
+  async paste(): Promise<void> {
+    const clipboard = this.state.clipboard;
+    if (!clipboard) {
+      this.setMessage("clipboard is empty");
+      return;
+    }
+    if (clipboard.mode === "cut") {
+      this.setMessage("cut/move not yet implemented");
+      return;
+    }
+    if (this.state.overlay?.kind === "progress") {
+      this.setMessage("a copy is already in progress");
+      return;
+    }
+
+    const destDir = this.state.cwd;
+    const { present, missing } = await partitionExisting(clipboard.paths);
+    if (present.length === 0) {
+      this.state.clipboard = null;
+      this.setMessage(
+        missing.length > 0
+          ? `nothing to paste — ${missing.length} item${missing.length === 1 ? "" : "s"} no longer exist`
+          : "nothing to paste",
+        "error",
+      );
+      return;
+    }
+
+    const abort = new AbortController();
+    this.pasteAbort = abort;
+    this.state.overlay = {
+      kind: "progress",
+      label: "Copying",
+      done: 0,
+      total: 0,
+      currentPath: "",
+      bytesDone: 0,
+      bytesTotal: 0,
+    };
+    this.notify();
+
+    let outcome: PasteOutcome;
+    try {
+      outcome = await runPasteJob({
+        destDir,
+        sources: present,
+        signal: abort.signal,
+        onProgress: (p) => {
+          // A stale callback from a paste that already finished (or was
+          // superseded) must never resurrect the overlay — see the
+          // `pasteAbort` field comment.
+          if (this.pasteAbort !== abort) return;
+          this.state.overlay = { kind: "progress", label: "Copying", ...p };
+          this.notify();
+        },
+      });
+    } finally {
+      if (this.pasteAbort === abort) this.pasteAbort = null;
+    }
+
+    this.state.overlay = null;
+    if (outcome.copiedSources.length > 0 && !outcome.cancelled) {
+      this.state.clipboard = null;
+    }
+    this.reportPasteOutcome(outcome, missing.length);
+    // Refresh so newly-pasted entries show up; load() notifies on its own.
+    await this.load(this.state.cwd);
+  }
+
+  /** Esc while the progress overlay is open (see keymap.ts's Escape precedence). */
+  cancelPaste(): void {
+    this.pasteAbort?.abort();
+  }
+
+  private reportPasteOutcome(
+    outcome: PasteOutcome,
+    vanishedCount: number,
+  ): void {
+    const parts: string[] = [];
+    if (outcome.cancelled) {
+      parts.push("copy cancelled");
+    } else if (outcome.copiedSources.length > 0) {
+      const n = outcome.copiedSources.length;
+      parts.push(`copied ${n} item${n === 1 ? "" : "s"}`);
+    }
+    if (outcome.skipped.length > 0) {
+      parts.push(`${outcome.skipped.length} rejected`);
+    }
+    if (outcome.errors.length > 0) {
+      parts.push(
+        `${outcome.errors.length} error${outcome.errors.length === 1 ? "" : "s"}`,
+      );
+    }
+    if (vanishedCount > 0) {
+      parts.push(`${vanishedCount} vanished`);
+    }
+    const kind: Message["kind"] =
+      outcome.errors.length > 0 || outcome.skipped.length > 0
+        ? "error"
+        : "info";
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing copied",
+      kind,
+    );
+  }
+
   // ── messages ──
 
   setMessage(text: string, kind: Message["kind"] = "info"): void {
@@ -507,4 +662,34 @@ export class Store {
     }, MESSAGE_TTL_MS);
     this.notify();
   }
+}
+
+// ── helpers ──
+
+/**
+ * Split `paths` into those that still `lstat` successfully and those that
+ * don't — the clipboard-staleness check `paste()` runs before ever queueing
+ * a job. Checked concurrently (`Promise.all`, same reasoning as
+ * `fsapi/scan.ts`'s stat fan-out) but the two output arrays preserve the
+ * original order of `paths`, not resolution order, so which name wins a
+ * same-basename conflict in `ops/queue.ts` stays deterministic given the
+ * same marks.
+ */
+async function partitionExisting(
+  paths: string[],
+): Promise<{ present: string[]; missing: string[] }> {
+  const stillExists = await Promise.all(
+    paths.map(async (p) => {
+      try {
+        await lstat(p);
+        return true;
+      } catch {
+        return false;
+      }
+    }),
+  );
+  const present: string[] = [];
+  const missing: string[] = [];
+  paths.forEach((p, i) => (stillExists[i] ? present.push(p) : missing.push(p)));
+  return { present, missing };
 }

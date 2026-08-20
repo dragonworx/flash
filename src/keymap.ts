@@ -55,9 +55,18 @@ export type Action =
   | { type: "markAll" }
   | { type: "copy" }
   | { type: "cut" }
-  // Escape-precedence arms. `clearMarks` is live as of Phase 4; `closeOverlay`
-  // (Phase 7) and `leaveArchive` (Phase 8) are still unreachable today (see
-  // the guards below) but typed so the table above compiles against them.
+  // Phase 5a: paste. `v` is already the view-toggle key, so `p` it is.
+  // Targets the current directory and consumes `AppState.clipboard` — see
+  // state/store.ts's `paste()`.
+  | { type: "paste" }
+  // Escape-precedence arms. `clearMarks` is live as of Phase 4.
+  // `closeOverlay` becomes live in Phase 5a too — the paste progress
+  // overlay is the first real `AppState.overlay` value, so arm 1 below is
+  // no longer only theoretical (see main.ts's handling of it: it cancels an
+  // in-flight paste rather than a bare close, since a progress overlay
+  // isn't just cosmetic). `leaveArchive` (Phase 8) is still unreachable
+  // today (see the guards below) but typed so the table above compiles
+  // against it.
   | { type: "closeOverlay" }
   | { type: "clearMarks" }
   | { type: "leaveArchive" };
@@ -143,6 +152,8 @@ export function resolveAction(key: Key, state: AppState): Action | null {
       return { type: "copy" };
     case "x":
       return { type: "cut" };
+    case "p":
+      return { type: "paste" };
     case "v":
       return { type: "toggleView" };
     case ".":

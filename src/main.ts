@@ -60,6 +60,7 @@ import {
   renderListHeader,
   renderListView,
 } from "./ui/listView.ts";
+import { renderProgressOverlay } from "./ui/overlay/progress.ts";
 
 // ── flag parsing ──
 
@@ -360,6 +361,12 @@ function draw(screen: Screen): void {
     });
   }
 
+  // Drawn last so it sits on top of the list/chrome underneath, per the
+  // plan's "progress overlay drawn over the file list."
+  if (state.overlay?.kind === "progress") {
+    renderProgressOverlay(screen, w, h, state.overlay, iconSet === "ascii");
+  }
+
   screen.flush();
 }
 
@@ -557,13 +564,24 @@ input.onKey((key: Key) => {
     case "cut":
       store.cut();
       break;
+    case "paste":
+      store
+        .paste()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
     case "clearMarks":
       store.clearMarks();
       break;
     case "closeOverlay":
+      // The paste progress overlay (Phase 5a) is the only real overlay so
+      // far — closing it means cancelling the in-flight copy, not a bare
+      // dismiss. Phase 7's help/prompt/permissions overlays will need a
+      // plain "just close" arm here too, once they exist.
+      if (store.getState().overlay?.kind === "progress") store.cancelPaste();
+      break;
     case "leaveArchive":
-      // Unreachable in Phase 4 — no overlays or archives exist yet. See
-      // keymap.ts's Escape precedence table.
+      // Unreachable — no archives exist yet (Phase 8). See keymap.ts's
+      // Escape precedence table.
       break;
   }
 });
