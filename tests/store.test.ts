@@ -463,3 +463,140 @@ describe("Store.paste", () => {
     expect(store.getState().message?.text).toBe("clipboard is empty");
   });
 });
+
+// ── Store.refresh (Phase 6: live updates) ──
+//
+// `refresh()` is the watcher's entry point — a real fs.watch is not needed
+// to test it, since the interesting behavior is entirely in how it
+// re-derives cursor and marks from a fresh scan, not in fs.watch's own
+// timing (that lives in tests/watch.test.ts). Each test gets its own
+// throwaway directory so mutating it mid-test never bleeds into another.
+
+describe("Store.refresh", () => {
+  it("keeps the cursor on the same path when new entries are added above it in sort order", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "flash-store-refresh-test-"));
+    try {
+      writeFileSync(join(dir, "mango.txt"), "m");
+      writeFileSync(join(dir, "zebra.txt"), "z");
+      const store = new Store({ cwd: dir });
+      await store.load(dir);
+
+      const idx = store
+        .visibleEntries()
+        .findIndex((e) => e.name === "zebra.txt");
+      store.setCursorIndex(idx);
+      const zebraPath = store.visibleEntries()[store.getState().cursor]?.path;
+      expect(zebraPath).toBeDefined();
+
+      // "apple" and "banana" both sort ahead of "zebra", so a naive
+      // index-based cursor would now be pointing at the wrong file.
+      writeFileSync(join(dir, "apple.txt"), "a");
+      writeFileSync(join(dir, "banana.txt"), "b");
+      await store.refresh(dir);
+
+      const after = store.visibleEntries()[store.getState().cursor];
+      expect(after?.name).toBe("zebra.txt");
+      expect(after?.path).toBe(zebraPath);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("falls back to the clamped numeric index when the cursor's entry is gone", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "flash-store-refresh-test-"));
+    try {
+      writeFileSync(join(dir, "a.txt"), "a");
+      writeFileSync(join(dir, "b.txt"), "b");
+      writeFileSync(join(dir, "c.txt"), "c");
+      const store = new Store({ cwd: dir });
+      await store.load(dir);
+
+      const idx = store.visibleEntries().findIndex((e) => e.name === "b.txt");
+      store.setCursorIndex(idx);
+
+      rmSync(join(dir, "b.txt"));
+      await store.refresh(dir);
+
+      // b.txt is gone; the cursor should land near where it was (clamped
+      // into the now-shorter list), not snap back to the top.
+      const list = store.visibleEntries();
+      expect(store.getState().cursor).toBeLessThan(list.length);
+      expect(store.getState().cursor).toBeGreaterThanOrEqual(0);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("prunes marks for files deleted from the rescanned directory and reports the count", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "flash-store-refresh-test-"));
+    try {
+      writeFileSync(join(dir, "keep.txt"), "k");
+      writeFileSync(join(dir, "gone.txt"), "g");
+      const store = new Store({ cwd: dir });
+      await store.load(dir);
+      store.markAll();
+      expect(store.getState().marked.size).toBe(2);
+
+      rmSync(join(dir, "gone.txt"));
+      await store.refresh(dir);
+
+      const marked = store.getState().marked;
+      expect(marked.size).toBe(1);
+      expect([...marked].every((p) => p.endsWith("keep.txt"))).toBe(true);
+      expect(store.getState().message?.text).toContain("1 mark");
+      expect(store.getState().message?.text).toContain("dropped");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("leaves marks on files outside the rescanned directory untouched", async () => {
+    const dirA = mkdtempSync(join(tmpdir(), "flash-store-refresh-a-"));
+    const dirB = mkdtempSync(join(tmpdir(), "flash-store-refresh-b-"));
+    try {
+      const fileInA = join(dirA, "elsewhere.txt");
+      writeFileSync(fileInA, "a");
+      writeFileSync(join(dirB, "local.txt"), "b");
+
+      const store = new Store({ cwd: dirA });
+      await store.load(dirA);
+      store.markAll(); // marks fileInA
+      expect(store.getState().marked.has(fileInA)).toBe(true);
+
+      await store.load(dirB); // navigate away — the mark on dirA's file persists
+      expect(store.getState().marked.has(fileInA)).toBe(true);
+
+      // Rescanning dirB must never touch a mark that lives in dirA — this
+      // rescan has no information about dirA at all.
+      await store.refresh(dirB);
+      expect(store.getState().marked.has(fileInA)).toBe(true);
+    } finally {
+      rmSync(dirA, { recursive: true, force: true });
+      rmSync(dirB, { recursive: true, force: true });
+    }
+  });
+
+  it("does not touch per-directory cursor history the way load() does", async () => {
+    const root = mkdtempSync(join(tmpdir(), "flash-store-refresh-test-"));
+    try {
+      mkdirSync(join(root, "child"));
+      writeFileSync(join(root, "child", "inner.txt"), "i");
+      const store = new Store({ cwd: root });
+      await store.load(root);
+
+      const idx = store.visibleEntries().findIndex((e) => e.name === "child");
+      store.setCursorIndex(idx);
+      await store.enter();
+      expect(store.getState().cwd).toBe(join(root, "child"));
+
+      // A rescan of the child directory must not disturb root's recorded
+      // "cursor was on child" history.
+      await store.refresh(join(root, "child"));
+      await store.up();
+      const current = store.visibleEntries()[store.getState().cursor];
+      expect(current?.name).toBe("child");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

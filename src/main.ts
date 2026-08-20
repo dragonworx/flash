@@ -32,6 +32,8 @@ import {
   loadConfig,
   saveConfig,
 } from "./config.ts";
+import { isBusy } from "./fsapi/ops/queue.ts";
+import { FsWatcher } from "./fsapi/watch.ts";
 import { resolveAction } from "./keymap.ts";
 import type { ViewMode } from "./state/store.ts";
 import { Store } from "./state/store.ts";
@@ -410,12 +412,24 @@ const input = new Input();
 
 let dirty = false;
 let repaintScheduled = false;
+// Phase 6: herdr enables focus reporting for every pane it spawns and
+// optimizes against panes that repaint while hidden (see the plan's herdr
+// section). `paneFocused` starts true — herdr's own initial focus event, if
+// any, only ever narrows this, and a plain terminal that never sends focus
+// events at all should behave exactly as before (always paint).
+let paneFocused = true;
 
 /**
  * Mark the screen dirty and schedule exactly one `draw()` on the next
  * macrotask. Safe to call any number of times per tick — every call after
  * the first is free. See the file header for why this is event-driven
  * rather than a fixed-rate loop.
+ *
+ * While the pane is unfocused the scheduled callback below leaves `dirty`
+ * set instead of clearing it, so any number of filesystem-triggered
+ * repaints while hidden collapse into the single `draw()` that runs the
+ * moment focus returns (see `input.onFocus` below), rather than each firing
+ * its own wasted write to a pane nobody can see.
  */
 function requestRepaint(): void {
   dirty = true;
@@ -423,7 +437,7 @@ function requestRepaint(): void {
   repaintScheduled = true;
   setImmediate(() => {
     repaintScheduled = false;
-    if (!dirty) return;
+    if (!dirty || !paneFocused) return;
     dirty = false;
     draw(screen);
   });
@@ -431,7 +445,9 @@ function requestRepaint(): void {
 
 // Re-announce OSC 7/0 only when cwd actually changes, not on every repaint,
 // and reset the grid scroll offset then too — a stale offset from the
-// previous directory's (possibly much taller) grid must not leak in.
+// previous directory's (possibly much taller) grid must not leak in. The
+// watcher (below) also only needs re-arming on a real cwd change, so this
+// same check drives its `retarget()` call.
 let lastAnnouncedCwd: string | null = null;
 store.subscribe(() => {
   const cwd = store.getState().cwd;
@@ -439,9 +455,47 @@ store.subscribe(() => {
     lastAnnouncedCwd = cwd;
     gridScrollRow = 0;
     osc.announceDirectory(cwd);
+    watcher.retarget(cwd);
   }
   requestRepaint();
 });
+
+// ── live updates (Phase 6) ──
+//
+// One fs.watch on the directory currently on screen, never recursive — see
+// fsapi/watch.ts's file header for the three verified failure modes this
+// wraps around. `suppressed` is checked by the watcher itself before every
+// settle: a running paste/cut job generates its own storm of events in the
+// destination directory, and state/store.ts's paste()/runCut() already
+// reload the directory once the job finishes, so there is nothing this
+// watcher needs to do while one is in flight.
+const watcher = new FsWatcher(
+  initialDir,
+  {
+    onSettle(dir, walkedUp) {
+      if (walkedUp) {
+        // The directory we were sitting in is gone; `dir` is the nearest
+        // surviving ancestor. This is a navigation, not an in-place
+        // refresh, so it goes through load() (cursor history, OSC
+        // announce via the subscribe block above) exactly like `up()`
+        // would, not refresh().
+        store.setMessage(
+          "this directory no longer exists — moved up to a surviving ancestor",
+          "error",
+        );
+        store.load(dir).catch((err) => {
+          store.setMessage(errorMessage(err), "error");
+        });
+      } else {
+        store.refresh(dir).catch((err) => {
+          store.setMessage(errorMessage(err), "error");
+        });
+      }
+    },
+  },
+  { suppressed: () => isBusy() },
+);
+caps.onTeardown(() => watcher.close());
 
 store.load(initialDir).catch((err) => {
   store.setMessage(`failed to load directory: ${errorMessage(err)}`, "error");
@@ -588,9 +642,12 @@ input.onKey((key: Key) => {
   }
 });
 
-input.onFocus(() => {
-  // Nothing to coalesce yet in this phase. Later phases stop repainting on
-  // filesystem events while unfocused and redraw once on focus return.
+input.onFocus((focused) => {
+  paneFocused = focused;
+  // On focus-out this just leaves `dirty` set for whenever focus returns
+  // (see requestRepaint's own comment). On focus-in it's what actually
+  // flushes a single repaint covering everything that changed underneath
+  // the pane while it was hidden.
   requestRepaint();
 });
 

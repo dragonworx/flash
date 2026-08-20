@@ -56,6 +56,19 @@
 // guard, or copied-but-failed-to-delete on the EXDEV fallback, see
 // ops/move.ts — are deliberately left alone, because those sources still
 // exist.
+//
+// Phase 6 (live updates) adds `refresh()`, the watcher's entry point,
+// deliberately separate from `load()` even though both scan a directory:
+// `load()` is a navigation — it consults/records per-directory history and
+// resets the cursor to "the first real entry" when it has nothing better to
+// go on, which is exactly right when you just walked into a directory but
+// wrong when the directory under you changed out from under you. `refresh()`
+// instead preserves the cursor by path (falling back to its old numeric
+// index, clamped, rather than jumping to the top) and prunes only the marks
+// that live in the rescanned directory — marks are deliberately allowed to
+// persist across navigation (see `clipboardCandidatePaths` below), so a mark
+// on a file in some other directory must survive a rescan of whatever
+// directory happens to be on screen right now.
 
 import { lstatSync } from "node:fs";
 import { lstat } from "node:fs/promises";
@@ -260,6 +273,67 @@ export class Store {
     }
     this.state.scrollTop = 0;
     this.setCursorByName(preferredName ?? this.history.get(dir));
+    this.notify();
+  }
+
+  /**
+   * Re-scan `dir` in place — the watcher's entry point (Phase 6), called
+   * after every debounced `fs.watch` burst settles. Not a navigation: it
+   * never touches per-directory cursor history, and it preserves the
+   * cursor **by path** rather than resetting to the first real entry — the
+   * entry under the cursor keeps the cursor if it still exists anywhere in
+   * the refreshed listing, and when it's gone the cursor falls back to its
+   * previous numeric index, clamped into the new (possibly shorter) list,
+   * so a file deleted elsewhere in a large directory doesn't yank the
+   * cursor back to the top.
+   *
+   * Marks are pruned too, but only the ones that live *in* `dir` — a mark
+   * on a file in some other directory (marks persist across navigation, see
+   * `clipboardCandidatePaths`) says nothing about this rescan and must
+   * survive it untouched. When marks actually get dropped, a status message
+   * says so, so the user's next paste/cut doesn't silently act on fewer
+   * items than they think are selected.
+   */
+  async refresh(dir: string): Promise<void> {
+    const prevList = this.visibleEntries();
+    const prevCursorEntry = prevList[this.state.cursor];
+    const prevCursor = this.state.cursor;
+
+    const result = await scan(dir);
+    this.state.cwd = dir;
+    if (result.ok) {
+      this.state.entries = result.entries;
+      this.state.scanError = null;
+    } else {
+      this.state.entries = [];
+      this.state.scanError = result.error;
+    }
+
+    this.resetRangeAnchor();
+    const list = this.visibleEntries();
+    if (list.length === 0) {
+      this.state.cursor = 0;
+    } else {
+      const idx = prevCursorEntry
+        ? list.findIndex((e) => e.path === prevCursorEntry.path)
+        : -1;
+      this.state.cursor =
+        idx >= 0 ? idx : Math.min(prevCursor, list.length - 1);
+    }
+
+    const newPaths = new Set(this.state.entries.map((e) => e.path));
+    const keep = new Set<string>();
+    for (const p of this.state.marked) {
+      if (dirname(p) !== dir || newPaths.has(p)) keep.add(p);
+    }
+    const before = this.state.marked.size;
+    this.pruneMarks(keep);
+    const dropped = before - this.state.marked.size;
+    if (dropped > 0) {
+      this.setMessage(
+        `${dropped} mark${dropped === 1 ? "" : "s"} dropped — file${dropped === 1 ? "" : "s"} no longer here`,
+      );
+    }
     this.notify();
   }
 

@@ -37,6 +37,38 @@ import * as ansi from "./ansi.ts";
 
 let sessionActive = false;
 
+// ── teardown hooks (Phase 6) ──
+//
+// Non-terminal cleanup — closing the fs.watch handle — that must run on
+// every path this process can stop, exactly once per callback registration.
+// Kept separate from the terminal-restoration logic below (a watch handle
+// has nothing to do with alt-screen/raw-mode state) but wired into the same
+// call site so main.ts has one place to register it instead of duplicating
+// this file's signal/exit plumbing. Run unconditionally at the top of
+// `leaveSession()`, *before* its own `sessionActive` idempotency guard, so a
+// callback registered here always fires even on a run where the terminal
+// session itself was never entered (e.g. --dump-frame never calls
+// enterSession, and never has anything registered either, but the ordering
+// still needs to be safe for that case).
+
+const teardownCallbacks: Array<() => void> = [];
+
+/** Register cleanup that must run before this process can exit. */
+export function onTeardown(cb: () => void): void {
+  teardownCallbacks.push(cb);
+}
+
+function runTeardown(): void {
+  for (const cb of teardownCallbacks) {
+    try {
+      cb();
+    } catch {
+      // A misbehaving callback must never block the terminal restore that
+      // follows it — see leaveSession() below.
+    }
+  }
+}
+
 function write(seq: string): void {
   process.stdout.write(seq);
 }
@@ -73,6 +105,7 @@ export function enterSession(): void {
  * Idempotent: calling this when no session is active does nothing.
  */
 export function leaveSession(): void {
+  runTeardown();
   if (!sessionActive) return;
   sessionActive = false;
 
