@@ -70,7 +70,8 @@ import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
 // ── flag parsing ──
 
 const USAGE = `flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|ascii]
-      [--hidden] [--no-color] [--dump-frame --size WxH [--color]] [--help] [--version]
+      [--hidden] [--no-color] [--dump-frame --size WxH [--color] [--open <name>]]
+      [--help] [--version]
 
   -d, --dir <path>    directory to open; defaults to the current directory
       --view <mode>   initial view mode: list | grid
@@ -80,6 +81,8 @@ const USAGE = `flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|
       --dump-frame    render one frame as text and exit (requires --size)
       --size <WxH>    terminal size to assume for --dump-frame
       --color         with --dump-frame, emit real ANSI instead of plain text
+      --open <name>   with --dump-frame, enter() the named child before rendering —
+                       e.g. a .zip fixture, so the frame captures browsing inside it
   -h, --help          show this message
   -v, --version       print the version number
 `;
@@ -102,6 +105,7 @@ function parseFlags() {
         "dump-frame": { type: "boolean", default: false },
         size: { type: "string" },
         color: { type: "boolean", default: false },
+        open: { type: "string" },
         help: { type: "boolean", short: "h", default: false },
         version: { type: "boolean", short: "v", default: false },
       },
@@ -135,6 +139,7 @@ const cliConfig = {
   dumpFrame: values["dump-frame"] ?? false,
   size: values.size,
   color: values.color ?? false,
+  open: values.open,
 };
 
 function fail(message: string): never {
@@ -286,7 +291,7 @@ function draw(screen: Screen): void {
   const state = store.getState();
   const frame = computeFrame(w, h, state.view);
 
-  renderBanner(screen, w, frame, state.cwd);
+  renderBanner(screen, w, frame, state.cwd, state.archive);
   const listEntries = state.view === "list" ? store.visibleEntries() : [];
   // Computed once and threaded through both the header and the row
   // rendering below — never recomputed separately — so the two can never
@@ -373,8 +378,14 @@ function draw(screen: Screen): void {
   if (state.overlay?.kind === "progress") {
     renderProgressOverlay(screen, w, h, state.overlay, iconSet === "ascii");
   } else if (state.overlay?.kind === "prompt") {
+    const promptTitle =
+      state.overlay.mode === "rename"
+        ? "Rename"
+        : state.overlay.mode === "mkdir"
+          ? "New directory"
+          : "New archive";
     renderPromptOverlay(screen, w, h, {
-      title: state.overlay.mode === "rename" ? "Rename" : "New directory",
+      title: promptTitle,
       value: state.overlay.value,
       cursor: state.overlay.cursor,
       error: state.overlay.error,
@@ -415,6 +426,15 @@ if (cliConfig.dumpFrame) {
     fail("--size must be positive, e.g. --size 80x24");
 
   await store.load(initialDir);
+  if (cliConfig.open) {
+    const idx = store
+      .visibleEntries()
+      .findIndex((e) => e.name === cliConfig.open);
+    if (idx < 0)
+      fail(`--open '${cliConfig.open}': no such entry in '${initialDir}'`);
+    store.setCursorIndex(idx);
+    await store.enter();
+  }
   const chunks: string[] = [];
   const screen = new Screen(
     columns,
@@ -732,9 +752,16 @@ input.onKey((key: Key) => {
         .applyPermissions()
         .catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
+    case "startArchive":
+      store.startArchive();
+      break;
+    case "startExtract":
+      store
+        .startExtract()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
     case "leaveArchive":
-      // Unreachable — no archives exist yet (Phase 8). See keymap.ts's
-      // Escape precedence table.
+      store.leaveArchive();
       break;
   }
 });

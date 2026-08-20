@@ -84,17 +84,35 @@
 // a stray keypress during an in-flight operation can't stack overlays.
 
 import { lstatSync } from "node:fs";
-import { rename as fsRename, lstat } from "node:fs/promises";
+import { rename as fsRename, lstat, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
+import {
+  type ArchiveTree,
+  archiveBasename,
+  archiveChildInner,
+  archiveEntriesAt,
+  archiveParentInner,
+  isZipFile,
+  loadArchiveTree,
+} from "../fsapi/archive/vfs.ts";
 import type { Entry } from "../fsapi/entry.ts";
 import { chmodPreserving } from "../fsapi/ops/chmod.ts";
+import { uniqueName } from "../fsapi/ops/conflict.ts";
 import { countTree, mkdir } from "../fsapi/ops/index.ts";
 import type {
+  CreateArchiveOutcome,
   CutOutcome,
   DeleteOutcome,
+  ExtractArchiveOutcome,
   PasteOutcome,
 } from "../fsapi/ops/queue.ts";
-import { runCutJob, runDeleteJob, runPasteJob } from "../fsapi/ops/queue.ts";
+import {
+  runCreateArchiveJob,
+  runCutJob,
+  runDeleteJob,
+  runExtractArchiveJob,
+  runPasteJob,
+} from "../fsapi/ops/queue.ts";
 import {
   DEFAULT_SORT,
   SORT_KEYS,
@@ -144,15 +162,21 @@ export type Overlay =
       bytesTotal: number;
     }
   /**
-   * Phase 7's rename/mkdir editor. `originalName`/`originalPath` are set
-   * only for `mode: "rename"` — `mkdir` has no source entry to rename and
-   * leaves both `null`. `error` is recomputed on every keystroke (see
-   * `updatePromptField` below) so validation is inline, not deferred to
-   * Enter.
+   * Phase 7's rename/mkdir editor, joined by Phase 8's `mode: "archive"`
+   * (the `z` key's "name the new zip" prompt). `originalName`/
+   * `originalPath` are set only for `mode: "rename"` — `mkdir` and
+   * `archive` have no single source entry to rename and leave both `null`.
+   * `error` is recomputed on every keystroke (see `updatePromptField`
+   * below) so validation is inline, not deferred to Enter — except the
+   * "already exists" check, which `archive` mode deliberately skips: a
+   * colliding name there is resolved automatically via `uniqueName()` at
+   * submit time (see `submitPrompt`) rather than refused, matching `z`'s
+   * plan-mandated "conflict resolution via uniqueName()" rather than
+   * rename/mkdir's "refuse outright."
    */
   | {
       kind: "prompt";
-      mode: "rename" | "mkdir";
+      mode: "rename" | "mkdir" | "archive";
       value: string;
       cursor: number;
       error: string | null;
@@ -250,6 +274,18 @@ export class Store {
   // already guarantees only one of them ever runs at a time. `closeOverlay`
   // (main.ts) aborts whichever of the two is actually set.
   private deleteAbort: AbortController | null = null;
+  // Same shape again, for Phase 8's `z`/`u` archive jobs — a third, separate
+  // field for the same reason `deleteAbort` isn't a reuse of `pasteAbort`
+  // above: conceptually distinct operations, sharing only `ops/queue.ts`'s
+  // `jobInFlight` guarantee that at most one of the three is ever set.
+  private archiveAbort: AbortController | null = null;
+  // The parsed member list for `state.archive?.zipPath` (Phase 8), loaded
+  // once by `openArchive()` and reused for every navigation inside it —
+  // not part of `AppState`, same reasoning as `history`/`rangeAnchor`
+  // above: the renderer only ever needs the `Entry[]` `visibleEntries()`
+  // derives from this, never the tree itself. `null` whenever
+  // `state.archive` is `null`.
+  private archiveTree: ArchiveTree | null = null;
 
   constructor(init: StoreInit) {
     this.state = {
@@ -287,16 +323,34 @@ export class Store {
   // ── derived view ──
 
   /**
-   * Real scanned children, hidden-filtered and sorted per `state.sort`, with
-   * a synthetic ".." row prepended (unless `cwd` is the filesystem root).
-   * The ".." row is real metadata — `lstatSync` on the parent — not zeros,
-   * so it renders through the same formatters as everything else; it is
-   * never affected by hidden-filtering or sorting.
+   * The un-filtered, un-sorted children of wherever the cursor actually is:
+   * `state.entries` (the last real scan of `state.cwd`) normally, or —
+   * while `state.archive` is set (Phase 8) — the archive's own children at
+   * `state.archive.innerPath`, served entirely from the cached
+   * `archiveTree` with no filesystem access at all. `cwd` itself never
+   * changes while browsing an archive (see the file header), only this
+   * source switches.
+   */
+  private rawEntries(): Entry[] {
+    if (this.state.archive && this.archiveTree) {
+      return archiveEntriesAt(this.archiveTree, this.state.archive.innerPath);
+    }
+    return this.state.entries;
+  }
+
+  /**
+   * `rawEntries()`, hidden-filtered and sorted per `state.sort`, with a
+   * synthetic ".." row prepended. Outside an archive that row is real
+   * metadata — `lstatSync` on the parent directory — not zeros, so it
+   * renders through the same formatters as everything else; inside one it's
+   * `parentEntry()`'s archive branch (see below). Either way it is never
+   * affected by hidden-filtering or sorting.
    */
   visibleEntries(): Entry[] {
+    const raw = this.rawEntries();
     const filtered = this.state.showHidden
-      ? this.state.entries
-      : this.state.entries.filter((e) => !e.name.startsWith("."));
+      ? raw
+      : raw.filter((e) => !e.name.startsWith("."));
     const sorted = sortEntries(filtered, this.state.sort);
     const parent = this.parentEntry();
     return parent ? [parent, ...sorted] : sorted;
@@ -304,12 +358,31 @@ export class Store {
 
   /** Count of real entries only (never counts the synthetic ".." row). */
   itemCount(): number {
+    const raw = this.rawEntries();
     return this.state.showHidden
-      ? this.state.entries.length
-      : this.state.entries.filter((e) => !e.name.startsWith(".")).length;
+      ? raw.length
+      : raw.filter((e) => !e.name.startsWith(".")).length;
   }
 
   private parentEntry(): Entry | null {
+    if (this.state.archive) {
+      // Always shown while browsing an archive, even at its root — there
+      // ".." means "leave the archive" (Escape's arm 3 / archiveUp(),
+      // below), never "nothing above this." Placeholder metadata, same
+      // shape as the real-filesystem catch branch below: nothing about a
+      // synthetic row needs to be a real stat.
+      return {
+        name: "..",
+        path: this.state.archive.zipPath,
+        kind: "dir",
+        size: 0,
+        mode: 0,
+        uid: 0,
+        gid: 0,
+        mtimeMs: 0,
+        width: stringWidth(".."),
+      };
+    }
     const parent = dirname(this.state.cwd);
     if (parent === this.state.cwd) return null; // already at the filesystem root
     try {
@@ -517,6 +590,13 @@ export class Store {
    * Enter the entry under the cursor if it is a directory, or a symlink
    * resolving to one (`targetKind === "dir"`) — Phase 2 is read-only
    * browsing, so anything else is a no-op. Selecting the ".." row goes up.
+   *
+   * Phase 8 adds two more cases, checked first: while `state.archive` is
+   * set, this only ever descends within the already-open archive (a leaf
+   * file inside one stays inert, same as a plain file outside one — this
+   * app has no "open" action for file contents anywhere); otherwise, a
+   * real `.zip` file under the cursor is opened via `openArchive()` instead
+   * of being a no-op the way any other non-directory entry is.
    */
   async enter(): Promise<void> {
     const list = this.visibleEntries();
@@ -526,16 +606,69 @@ export class Store {
       await this.up();
       return;
     }
+    if (this.state.archive) {
+      if (entry.kind !== "dir") return;
+      const archive = this.state.archive;
+      this.resetRangeAnchor();
+      this.state.archive = {
+        ...archive,
+        innerPath: archiveChildInner(archive.innerPath, entry.name),
+      };
+      this.state.cursor = 0;
+      this.state.scrollTop = 0;
+      this.notify();
+      return;
+    }
     const isDirLike =
       entry.kind === "dir" ||
       (entry.kind === "symlink" && entry.targetKind === "dir");
-    if (!isDirLike) return;
-    this.recordHistory();
-    await this.load(entry.path);
+    if (isDirLike) {
+      this.recordHistory();
+      await this.load(entry.path);
+      return;
+    }
+    if (isZipFile(entry)) {
+      await this.openArchive(entry.path);
+    }
   }
 
-  /** Go up one directory. A no-op at the filesystem root. */
+  /**
+   * Open `zipPath` as a virtual directory: parse (or reuse the cached
+   * parse of) its member list, then set `state.archive` to its root.
+   * `state.cwd` is deliberately left untouched — see the file header — so
+   * every write-op guard and the watcher keep referring to the real
+   * directory the zip file lives in.
+   */
+  private async openArchive(zipPath: string): Promise<void> {
+    let tree: ArchiveTree;
+    try {
+      tree = await loadArchiveTree(zipPath);
+    } catch (err) {
+      this.setMessage(`could not open archive: ${errorMessage(err)}`, "error");
+      return;
+    }
+    this.archiveTree = tree;
+    this.state.archive = { zipPath, innerPath: "" };
+    this.resetRangeAnchor();
+    this.state.cursor = 0;
+    this.state.scrollTop = 0;
+    this.notify();
+  }
+
+  /**
+   * Go up one level. Outside an archive this goes up a real directory (a
+   * no-op at the filesystem root); while `state.archive` is set it instead
+   * ascends within the archive, or — at the archive's own root —
+   * leaves it entirely (`leaveArchive()`). This is what makes `h`/
+   * `Backspace`/`←` (which call `up()` directly, bypassing Escape's
+   * precedence table entirely — see keymap.ts) work the same way Escape's
+   * arm 3 does at the archive root, without duplicating the logic.
+   */
   async up(): Promise<void> {
+    if (this.state.archive) {
+      this.archiveUp();
+      return;
+    }
     const parent = dirname(this.state.cwd);
     if (parent === this.state.cwd) return;
     const childName = basename(this.state.cwd);
@@ -543,6 +676,40 @@ export class Store {
     // Prefer the directory just left over any older recorded history for
     // the parent — that is the whole point of this method.
     await this.load(parent, childName || undefined);
+  }
+
+  private archiveUp(): void {
+    const archive = this.state.archive;
+    if (!archive) return;
+    if (archive.innerPath === "") {
+      this.leaveArchive();
+      return;
+    }
+    const childName = archiveBasename(archive.innerPath);
+    this.state.archive = {
+      ...archive,
+      innerPath: archiveParentInner(archive.innerPath),
+    };
+    this.state.scrollTop = 0;
+    this.setCursorByName(childName); // lands on the directory just left, same convention as real up()
+    this.notify();
+  }
+
+  /**
+   * Pop back out to the real filesystem — Escape's arm 3 (keymap.ts's
+   * `leaveArchive` action, reached only at the archive root) and
+   * `archiveUp()` above both resolve here. The cursor lands on the zip
+   * file itself, the same "land on what you just left" convention `up()`
+   * follows for a real directory.
+   */
+  leaveArchive(): void {
+    const archive = this.state.archive;
+    if (!archive) return;
+    this.state.archive = null;
+    this.archiveTree = null;
+    this.state.scrollTop = 0;
+    this.setCursorByName(basename(archive.zipPath));
+    this.notify();
   }
 
   // ── toggles ──
@@ -670,6 +837,26 @@ export class Store {
     if (changed) this.notify();
   }
 
+  // ── archive read-only guard (Phase 8) ──
+
+  /**
+   * Every write operation — rename, mkdir, delete, chmod, copy/cut/paste —
+   * refuses outright while `state.archive` is set, per the plan
+   * ("everything is read-only" while browsing inside an archive). One
+   * shared helper so the message and the check can't drift between call
+   * sites: sets the standard refusal message and returns `true` when the
+   * caller should bail, `false` when it's safe to proceed. `u` (extract)
+   * uses this too, even though it operates on a real `.zip` file under the
+   * cursor — there's no nested-archive browsing in this app, so extracting
+   * one archive from inside another is out of scope the same way every
+   * other write is.
+   */
+  private refuseInsideArchive(): boolean {
+    if (!this.state.archive) return false;
+    this.setMessage("read-only while browsing an archive", "error");
+    return true;
+  }
+
   // ── clipboard ──
 
   /**
@@ -677,6 +864,11 @@ export class Store {
    * cursor, the fallback that makes a single-file copy/cut fast — into the
    * clipboard register. Nothing here touches disk: per the plan, a cut is
    * non-destructive until Phase 5a's paste actually runs.
+   *
+   * Refuses inside an archive (Phase 8): copying a member out one at a time
+   * via the clipboard isn't implemented in this pass — `u` (extract the
+   * whole archive) is the supported path for getting contents out. See
+   * fsapi/archive/vfs.ts's file header.
    */
   copy(): void {
     this.stageClipboard("copy");
@@ -687,6 +879,7 @@ export class Store {
   }
 
   private stageClipboard(mode: "copy" | "cut"): void {
+    if (this.refuseInsideArchive()) return;
     const paths = this.clipboardCandidatePaths();
     if (paths.length === 0) {
       this.setMessage(`nothing to ${mode}`);
@@ -712,9 +905,11 @@ export class Store {
    * `mode: "copy"`, moves it for `mode: "cut"`. Both branches share the
    * abort/progress-overlay bookkeeping below; only what happens to the
    * sources afterward (and the job each queues into) differs — see
-   * `runCopy`/`runCut`.
+   * `runCopy`/`runCut`. Refuses inside an archive (Phase 8) — "paste-into"
+   * is one of the write ops the plan explicitly calls out.
    */
   async paste(): Promise<void> {
+    if (this.refuseInsideArchive()) return;
     const clipboard = this.state.clipboard;
     if (!clipboard) {
       this.setMessage("clipboard is empty");
@@ -872,13 +1067,14 @@ export class Store {
    * Esc while the progress overlay is open, Phase 7 version — main.ts's
    * `closeOverlay` case calls this instead of `cancelPaste()` for a
    * "Deleting" progress overlay. Aborts whichever of `pasteAbort`/
-   * `deleteAbort` is actually set; harmless to call both since at most one
-   * is ever non-null (`ops/queue.ts`'s `jobInFlight` guarantees only one
-   * job runs at a time).
+   * `deleteAbort`/`archiveAbort` is actually set; harmless to call all
+   * three since at most one is ever non-null (`ops/queue.ts`'s
+   * `jobInFlight` guarantees only one job runs at a time).
    */
   cancelOperation(): void {
     this.pasteAbort?.abort();
     this.deleteAbort?.abort();
+    this.archiveAbort?.abort();
   }
 
   private reportPasteOutcome(
@@ -955,6 +1151,7 @@ export class Store {
    */
   startRename(): void {
     if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
     const list = this.visibleEntries();
     const entry = list[this.state.cursor];
     if (!entry || entry.name === "..") return;
@@ -973,6 +1170,7 @@ export class Store {
   /** Open the mkdir prompt, empty. Same already-open guard as `startRename`. */
   startMkdir(): void {
     if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
     this.state.overlay = {
       kind: "prompt",
       mode: "mkdir",
@@ -1003,9 +1201,14 @@ export class Store {
     const next = edit({ value: overlay.value, cursor: overlay.cursor });
     overlay.value = next.value;
     overlay.cursor = next.cursor;
+    // `archive` mode skips the "already exists" check — see the Overlay
+    // type's comment: a colliding name there is resolved automatically via
+    // `uniqueName()` at submit time instead of refused inline.
     overlay.error = validateName(
       overlay.value,
-      new Set(this.state.entries.map((e) => e.name)),
+      overlay.mode === "archive"
+        ? new Set()
+        : new Set(this.state.entries.map((e) => e.name)),
       overlay.originalName ?? undefined,
     );
     this.notify();
@@ -1070,12 +1273,40 @@ export class Store {
     const name = overlay.value;
     const err = validateName(
       name,
-      new Set(this.state.entries.map((e) => e.name)),
+      overlay.mode === "archive"
+        ? new Set()
+        : new Set(this.state.entries.map((e) => e.name)),
       overlay.originalName ?? undefined,
     );
     if (err) {
       overlay.error = err;
       this.notify();
+      return;
+    }
+
+    if (overlay.mode === "archive") {
+      // Targets were already validated non-empty when `startArchive()`
+      // opened this prompt; marks/cursor haven't changed since (the prompt
+      // overlay captures all input), so recomputing here rather than
+      // threading a payload through `Overlay` is simplest and always
+      // consistent with what the user was shown.
+      const targets = this.clipboardCandidatePaths();
+      if (targets.length === 0) {
+        this.state.overlay = null;
+        this.setMessage("nothing to zip", "error");
+        return;
+      }
+      let existing = new Set<string>();
+      try {
+        existing = new Set(await readdir(this.state.cwd));
+      } catch {
+        // Degrades to "no known collisions" — same acceptance as
+        // ops/queue.ts's planJobs when its own readdir fails.
+      }
+      const finalName = uniqueName(name, existing);
+      const zipPath = join(this.state.cwd, finalName);
+      this.state.overlay = null;
+      await this.runCreateArchive(zipPath, targets, finalName);
       return;
     }
 
@@ -1149,6 +1380,7 @@ export class Store {
    */
   async startDelete(): Promise<void> {
     if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
     const all = this.clipboardCandidatePaths();
     if (all.length === 0) {
       this.setMessage("nothing to delete");
@@ -1303,6 +1535,198 @@ export class Store {
     );
   }
 
+  // ── archives (Phase 8) ──
+
+  /**
+   * `z` — open the "name the new zip" prompt, seeded with a suggested name
+   * (the single target's own basename with `.zip` appended, or a generic
+   * `archive.zip` for a multi-item selection) so Enter alone produces a
+   * reasonable result. Targets are the marked set, or the cursor entry when
+   * nothing is marked — same `clipboardCandidatePaths()` fallback copy/cut/
+   * delete/chmod all use. Refuses inside an archive (there is no
+   * archive-of-an-archive in this app) and while any overlay is already
+   * open, the same guards every other `startX` method has.
+   */
+  startArchive(): void {
+    if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
+    const targets = this.clipboardCandidatePaths();
+    if (targets.length === 0) {
+      this.setMessage("nothing to zip");
+      return;
+    }
+    const suggested =
+      targets.length === 1
+        ? `${basename(targets[0] as string)}.zip`
+        : "archive.zip";
+    this.state.overlay = {
+      kind: "prompt",
+      mode: "archive",
+      value: suggested,
+      cursor: graphemes(suggested).length,
+      error: null,
+      originalName: null,
+      originalPath: null,
+    };
+    this.notify();
+  }
+
+  /**
+   * Run `fsapi/archive/zip.ts`'s `createZip` through the shared job queue
+   * (`ops/queue.ts`'s `runCreateArchiveJob`, guarded by the same
+   * `jobInFlight` flag paste/cut/delete share), with the same progress-
+   * overlay/AbortController bookkeeping `runCopy`/`runCut` use — `zipPath`
+   * has already been conflict-resolved by `submitPrompt` before this is
+   * called.
+   */
+  private async runCreateArchive(
+    zipPath: string,
+    sources: string[],
+    displayName: string,
+  ): Promise<void> {
+    const abort = new AbortController();
+    this.archiveAbort = abort;
+    this.state.overlay = {
+      kind: "progress",
+      label: "Zipping",
+      done: 0,
+      total: 0,
+      currentPath: "",
+      bytesDone: 0,
+      bytesTotal: 0,
+    };
+    this.notify();
+
+    let outcome: CreateArchiveOutcome;
+    try {
+      outcome = await runCreateArchiveJob({
+        zipPath,
+        sources,
+        signal: abort.signal,
+        onProgress: (p) => {
+          if (this.archiveAbort !== abort) return;
+          this.state.overlay = { kind: "progress", label: "Zipping", ...p };
+          this.notify();
+        },
+      });
+    } finally {
+      if (this.archiveAbort === abort) this.archiveAbort = null;
+    }
+
+    this.state.overlay = null;
+    const parts: string[] = [];
+    if (outcome.cancelled) {
+      parts.push("zip cancelled");
+    } else if (outcome.addedCount > 0) {
+      parts.push(`created '${displayName}'`);
+    }
+    if (outcome.errors.length > 0) {
+      parts.push(
+        `${outcome.errors.length} error${outcome.errors.length === 1 ? "" : "s"}`,
+      );
+    }
+    const kind: Message["kind"] = outcome.errors.length > 0 ? "error" : "info";
+    // refresh() before setMessage() — see submitPrompt's mkdir branch for
+    // why: refresh() can set its own "N marks dropped" message, which would
+    // otherwise silently clobber this method's own outcome message.
+    await this.refresh(this.state.cwd);
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing zipped",
+      kind,
+    );
+  }
+
+  /**
+   * `u` — extract the archive under the cursor into a new, conflict-
+   * resolved subdirectory of the current directory (named after the
+   * archive, extension stripped where it's a plain `.zip`). Refuses inside
+   * an archive and while any overlay is already open, same as every other
+   * `startX` method.
+   */
+  async startExtract(): Promise<void> {
+    if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
+    const list = this.visibleEntries();
+    const entry = list[this.state.cursor];
+    if (!entry || entry.name === "..") {
+      this.setMessage("nothing to extract");
+      return;
+    }
+    if (!isZipFile(entry)) {
+      this.setMessage("not a zip archive");
+      return;
+    }
+
+    let existing = new Set<string>();
+    try {
+      existing = new Set(await readdir(this.state.cwd));
+    } catch {
+      // Degrades to "no known collisions" — same acceptance as elsewhere.
+    }
+    const base = basename(entry.name, ".zip") || entry.name;
+    const destName = uniqueName(base, existing);
+    const destDir = join(this.state.cwd, destName);
+    try {
+      await mkdir(destDir);
+    } catch (err) {
+      this.setMessage(
+        `could not create '${destName}': ${errorMessage(err)}`,
+        "error",
+      );
+      return;
+    }
+
+    const abort = new AbortController();
+    this.archiveAbort = abort;
+    this.state.overlay = {
+      kind: "progress",
+      label: "Extracting",
+      done: 0,
+      total: 0,
+      currentPath: "",
+      bytesDone: 0,
+      bytesTotal: 0,
+    };
+    this.notify();
+
+    let outcome: ExtractArchiveOutcome;
+    try {
+      outcome = await runExtractArchiveJob({
+        zipPath: entry.path,
+        destDir,
+        signal: abort.signal,
+        onProgress: (p) => {
+          if (this.archiveAbort !== abort) return;
+          this.state.overlay = { kind: "progress", label: "Extracting", ...p };
+          this.notify();
+        },
+      });
+    } finally {
+      if (this.archiveAbort === abort) this.archiveAbort = null;
+    }
+
+    this.state.overlay = null;
+    const parts: string[] = [];
+    if (outcome.cancelled) {
+      parts.push("extraction cancelled");
+    } else if (outcome.extractedCount > 0) {
+      parts.push(
+        `extracted ${outcome.extractedCount} item${outcome.extractedCount === 1 ? "" : "s"} to '${destName}/'`,
+      );
+    }
+    if (outcome.errors.length > 0) {
+      parts.push(
+        `${outcome.errors.length} error${outcome.errors.length === 1 ? "" : "s"}`,
+      );
+    }
+    const kind: Message["kind"] = outcome.errors.length > 0 ? "error" : "info";
+    await this.refresh(this.state.cwd);
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing extracted",
+      kind,
+    );
+  }
+
   // ── permissions / chmod (Phase 7) ──
 
   /**
@@ -1321,6 +1745,7 @@ export class Store {
    */
   startPermissions(): void {
     if (this.state.overlay) return;
+    if (this.refuseInsideArchive()) return;
     const paths = this.clipboardCandidatePaths();
     if (paths.length === 0) {
       this.setMessage("nothing to change permissions on");

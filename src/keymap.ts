@@ -12,13 +12,15 @@
 //   2. Marks exist -> clear them.
 //   3. Browsing an archive at its root -> leave the archive.
 //   4. Otherwise -> go up one directory.
-// Arms 1, 2, and 4 are reachable as of Phase 7 (Phase 5a's progress overlay
-// and Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
-// marks have been real since Phase 4); arm 3 (archives, Phase 8) is still
-// unreachable — but the table was written in full back in Phase 2 so each
-// later phase slots in by editing one guard function, not by restructuring
-// this file. Phase 4 itself needed no change here at all: `s.marked.size >
-// 0` was already the guard.
+// All four arms are reachable as of Phase 8: Phase 5a's progress overlay and
+// Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
+// marks have been real since Phase 4; arm 3 (`isArchiveRoot`, below) is real
+// as of Phase 8, once `state/store.ts`'s `enter()` can actually set
+// `state.archive`. The table was written in full back in Phase 2 so each
+// later phase slotted in by editing one guard function, never by
+// restructuring this file — Phase 4 needed no change here at all
+// (`s.marked.size > 0` was already the guard), and Phase 8 only needed
+// `isArchiveRoot()` to stop being a stub that could never return true.
 //
 // `h` and `Backspace` bypass this table entirely and always go up, so there
 // is always a way to navigate that never depends on Escape's state. `←`
@@ -85,7 +87,14 @@ export type Action =
   | { type: "startMkdir" }
   | { type: "startDelete" }
   | { type: "startPermissions" }
-  // ui/overlay/prompt.ts's one-line editor (rename, mkdir).
+  // Phase 8: archives. `startArchive` (`z`) opens the same `prompt`
+  // overlay rename/mkdir use, just with `mode: "archive"` — see
+  // state/store.ts's `Overlay` type. `startExtract` (`u`) has no overlay
+  // of its own at all; it goes straight to the progress overlay, same as
+  // `paste`/`confirmDelete` do once their own setup is done.
+  | { type: "startArchive" }
+  | { type: "startExtract" }
+  // ui/overlay/prompt.ts's one-line editor (rename, mkdir, archive).
   | { type: "promptChar"; ch: string }
   | { type: "promptBackspace" }
   | { type: "promptDeleteForward" }
@@ -304,6 +313,10 @@ export function resolveAction(key: Key, state: AppState): Action | null {
       return { type: "startDelete" };
     case "m":
       return { type: "startPermissions" };
+    case "z":
+      return { type: "startArchive" };
+    case "u":
+      return { type: "startExtract" };
     case "v":
       return { type: "toggleView" };
     case ".":

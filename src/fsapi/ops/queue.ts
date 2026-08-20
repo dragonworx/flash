@@ -30,6 +30,12 @@
 
 import { readdir } from "node:fs/promises";
 import { basename } from "node:path";
+import {
+  type ArchiveError,
+  type ArchiveProgress,
+  createZip,
+  extractZip,
+} from "../archive/zip.ts";
 import { uniqueName } from "./conflict.ts";
 import { type CopyError, type CopyProgress, copyAll } from "./copy.ts";
 import { checkContainment } from "./guard.ts";
@@ -280,6 +286,93 @@ export async function runDeleteJob(
     }
 
     return { deletedSources: deleted, errors, cancelled: false };
+  } finally {
+    jobInFlight = false;
+  }
+}
+
+// ── archives (Phase 8) ──
+//
+// Both jobs below share `jobInFlight` with paste/cut/delete above — a `z`
+// or `u` racing a paste (or each other) would interleave two operations'
+// progress into the same overlay exactly like a cut racing a paste would,
+// so both refuse a second call while anything is already running
+// (state/store.ts's `startArchive()`/`startExtract()` also check
+// `state.overlay` before ever calling in, so this is a backstop, not the
+// primary guard — same relationship `runPasteJob` has to `paste()`).
+// Neither needs its own `planJobs`-style conflict resolution: `createZip`'s
+// destination name and `extractZip`'s destination directory are both
+// already conflict-resolved by the caller before the job is ever queued
+// (see `submitPrompt`'s `archive` branch and `startExtract()`).
+
+export type CreateArchiveOutcome = {
+  addedCount: number;
+  errors: ArchiveError[];
+  cancelled: boolean;
+};
+
+export type CreateArchiveOptions = {
+  zipPath: string;
+  sources: string[];
+  signal?: AbortSignal;
+  onProgress?: (progress: ArchiveProgress) => void;
+};
+
+export async function runCreateArchiveJob(
+  opts: CreateArchiveOptions,
+): Promise<CreateArchiveOutcome> {
+  if (jobInFlight) {
+    return {
+      addedCount: 0,
+      errors: opts.sources.map((path) => ({
+        path,
+        message: "an operation is already in progress",
+      })),
+      cancelled: false,
+    };
+  }
+  jobInFlight = true;
+  try {
+    return await createZip(opts.zipPath, opts.sources, {
+      signal: opts.signal,
+      onProgress: opts.onProgress,
+    });
+  } finally {
+    jobInFlight = false;
+  }
+}
+
+export type ExtractArchiveOutcome = {
+  extractedCount: number;
+  errors: ArchiveError[];
+  cancelled: boolean;
+};
+
+export type ExtractArchiveOptions = {
+  zipPath: string;
+  destDir: string;
+  signal?: AbortSignal;
+  onProgress?: (progress: ArchiveProgress) => void;
+};
+
+export async function runExtractArchiveJob(
+  opts: ExtractArchiveOptions,
+): Promise<ExtractArchiveOutcome> {
+  if (jobInFlight) {
+    return {
+      extractedCount: 0,
+      errors: [
+        { path: opts.zipPath, message: "an operation is already in progress" },
+      ],
+      cancelled: false,
+    };
+  }
+  jobInFlight = true;
+  try {
+    return await extractZip(opts.zipPath, opts.destDir, {
+      signal: opts.signal,
+      onProgress: opts.onProgress,
+    });
   } finally {
     jobInFlight = false;
   }
