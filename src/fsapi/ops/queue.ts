@@ -33,6 +33,7 @@ import { basename } from "node:path";
 import { uniqueName } from "./conflict.ts";
 import { type CopyError, type CopyProgress, copyAll } from "./copy.ts";
 import { checkContainment } from "./guard.ts";
+import { RemoveAbortedError, remove } from "./index.ts";
 import { type MoveOutcome, type RenameFn, moveAll } from "./move.ts";
 
 export type SkippedSource = { src: string; message: string };
@@ -189,6 +190,96 @@ export async function runCutJob(opts: CutOptions): Promise<CutOutcome> {
     });
 
     return { ...outcome, skipped };
+  } finally {
+    jobInFlight = false;
+  }
+}
+
+// ── delete (Phase 7) ──
+
+export type DeleteError = { src: string; message: string };
+
+export type DeleteOutcome = {
+  deletedSources: string[];
+  errors: DeleteError[];
+  cancelled: boolean;
+};
+
+export type DeleteProgress = {
+  done: number;
+  total: number;
+  currentPath: string;
+};
+
+export type DeleteOptions = {
+  sources: string[];
+  signal?: AbortSignal;
+  onProgress?: (progress: DeleteProgress) => void;
+};
+
+/**
+ * Delete every source in turn through `ops/index.ts`'s `remove()` — one job
+ * at a time, sharing `jobInFlight` with paste/cut, so a delete suppresses
+ * the watcher's rescan (`main.ts`'s `isBusy()` check) exactly like they do,
+ * and a delete can never interleave with a paste or another delete.
+ *
+ * There is no `planJobs` step here: delete has no destination, so neither
+ * the containment guard nor conflict-name resolution applies — every
+ * source the caller hands in is attempted.
+ *
+ * Progress is per top-level source (`done`/`total` count sources, not
+ * descendant files or bytes) — coarser than copy's, an accepted
+ * simplification: `remove()` has no upfront total to report, and
+ * `state/store.ts`'s confirm overlay already did a separate, capped count
+ * for the blast-radius message before this job ever starts, which is not
+ * the same number and is not threaded through here.
+ */
+export async function runDeleteJob(
+  opts: DeleteOptions,
+): Promise<DeleteOutcome> {
+  if (jobInFlight) {
+    return {
+      deletedSources: [],
+      errors: opts.sources.map((src) => ({
+        src,
+        message: "an operation is already in progress",
+      })),
+      cancelled: false,
+    };
+  }
+
+  jobInFlight = true;
+  try {
+    const total = opts.sources.length;
+    const deleted: string[] = [];
+    const errors: DeleteError[] = [];
+
+    for (let i = 0; i < opts.sources.length; i++) {
+      const src = opts.sources[i];
+      if (src === undefined) continue;
+      if (opts.signal?.aborted) {
+        return { deletedSources: deleted, errors, cancelled: true };
+      }
+      try {
+        await remove(src, {
+          signal: opts.signal,
+          onProgress: (path) =>
+            opts.onProgress?.({ done: i, total, currentPath: path }),
+        });
+        deleted.push(src);
+      } catch (err) {
+        if (err instanceof RemoveAbortedError) {
+          return { deletedSources: deleted, errors, cancelled: true };
+        }
+        errors.push({
+          src,
+          message: err instanceof Error ? err.message : String(err),
+        });
+      }
+      opts.onProgress?.({ done: i + 1, total, currentPath: src });
+    }
+
+    return { deletedSources: deleted, errors, cancelled: false };
   } finally {
     jobInFlight = false;
   }

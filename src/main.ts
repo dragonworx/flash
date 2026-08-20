@@ -63,6 +63,7 @@ import {
   renderListView,
 } from "./ui/listView.ts";
 import { renderProgressOverlay } from "./ui/overlay/progress.ts";
+import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
 
 // ── flag parsing ──
 
@@ -364,9 +365,18 @@ function draw(screen: Screen): void {
   }
 
   // Drawn last so it sits on top of the list/chrome underneath, per the
-  // plan's "progress overlay drawn over the file list."
+  // plan's "progress overlay drawn over the file list." Only one overlay is
+  // ever open at once (`state.overlay` is a single field), so this is an
+  // if/else-if chain, not independent checks.
   if (state.overlay?.kind === "progress") {
     renderProgressOverlay(screen, w, h, state.overlay, iconSet === "ascii");
+  } else if (state.overlay?.kind === "prompt") {
+    renderPromptOverlay(screen, w, h, {
+      title: state.overlay.mode === "rename" ? "Rename" : "New directory",
+      value: state.overlay.value,
+      cursor: state.overlay.cursor,
+      error: state.overlay.error,
+    });
   }
 
   screen.flush();
@@ -626,14 +636,66 @@ input.onKey((key: Key) => {
     case "clearMarks":
       store.clearMarks();
       break;
-    case "closeOverlay":
-      // The paste/cut progress overlay (Phase 5a/5b) is the only real
-      // overlay so far — closing it means cancelling the in-flight copy or
-      // move, not a bare dismiss. `cancelPaste()` covers both: it just
-      // aborts whichever `AbortController` `state/store.ts` has staged.
-      // Phase 7's help/prompt/permissions overlays will need a plain "just
-      // close" arm here too, once they exist.
-      if (store.getState().overlay?.kind === "progress") store.cancelPaste();
+    case "closeOverlay": {
+      // A progress overlay (paste/cut/delete) closing means cancelling the
+      // in-flight job, not a bare dismiss — `cancelOperation()` aborts
+      // whichever of paste's/delete's AbortControllers `state/store.ts` has
+      // staged. Every other overlay just closes.
+      const overlay = store.getState().overlay;
+      if (overlay?.kind === "progress") store.cancelOperation();
+      else if (overlay?.kind === "prompt") store.cancelPrompt();
+      break;
+    }
+    case "startRename":
+      store.startRename();
+      break;
+    case "startMkdir":
+      store.startMkdir();
+      break;
+    case "promptChar":
+      store.promptInsertChar(action.ch);
+      break;
+    case "promptBackspace":
+      store.promptBackspace();
+      break;
+    case "promptDeleteForward":
+      store.promptDeleteForward();
+      break;
+    case "promptLeft":
+      store.promptMoveLeft();
+      break;
+    case "promptRight":
+      store.promptMoveRight();
+      break;
+    case "promptHome":
+      store.promptMoveHome();
+      break;
+    case "promptEnd":
+      store.promptMoveEnd();
+      break;
+    case "promptWordDelete":
+      store.promptDeleteWordBack();
+      break;
+    case "promptClearToStart":
+      store.promptClearToStart();
+      break;
+    case "promptSubmit":
+      store
+        .submitPrompt()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
+    case "startDelete":
+    case "startPermissions":
+    case "confirmYes":
+    case "confirmCancel":
+    case "permMoveFocus":
+    case "permToggle":
+    case "permDigit":
+    case "permApply":
+      // Wired in once ui/overlay/confirm.ts and ui/overlay/permissions.ts
+      // land (later in Phase 7) — the keymap table already routes their
+      // keys, per the same "declare the whole table up front" approach
+      // Phase 2 used for Escape's precedence arms.
       break;
     case "leaveArchive":
       // Unreachable — no archives exist yet (Phase 8). See keymap.ts's

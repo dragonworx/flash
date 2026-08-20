@@ -12,12 +12,13 @@
 //   2. Marks exist -> clear them.
 //   3. Browsing an archive at its root -> leave the archive.
 //   4. Otherwise -> go up one directory.
-// Arms 2 and 4 are reachable as of Phase 4 (marks are real now); arm 1
-// (overlays, Phase 7) and arm 3 (archives, Phase 8) are still unreachable —
-// but the table was written in full back in Phase 2 so each later phase
-// slots in by editing one guard function, not by restructuring this file.
-// Phase 4 itself needed no change here at all: `s.marked.size > 0` was
-// already the guard.
+// Arms 1, 2, and 4 are reachable as of Phase 7 (Phase 5a's progress overlay
+// and Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
+// marks have been real since Phase 4); arm 3 (archives, Phase 8) is still
+// unreachable — but the table was written in full back in Phase 2 so each
+// later phase slots in by editing one guard function, not by restructuring
+// this file. Phase 4 itself needed no change here at all: `s.marked.size >
+// 0` was already the guard.
 //
 // `h` and `Backspace` bypass this table entirely and always go up, so there
 // is always a way to navigate that never depends on Escape's state. `←`
@@ -69,7 +70,42 @@ export type Action =
   // against it.
   | { type: "closeOverlay" }
   | { type: "clearMarks" }
-  | { type: "leaveArchive" };
+  | { type: "leaveArchive" }
+  // Phase 7: rename, mkdir, delete, permissions. The four `startX` actions
+  // only ever reach `state/store.ts` when no overlay is already open (each
+  // `startX` method re-checks that itself, since a key can still slip
+  // through here between "an overlay opened" and "the next repaint" — see
+  // their comments). Every other action below is only ever emitted while
+  // the matching overlay is open — see `resolvePromptKey`/
+  // `resolveConfirmKey`/`resolvePermissionsKey`, which `resolveAction`
+  // dispatches to before it ever reaches the plain-navigation table at the
+  // bottom of this file, exactly like Escape's precedence table already
+  // short-circuits everything else.
+  | { type: "startRename" }
+  | { type: "startMkdir" }
+  | { type: "startDelete" }
+  | { type: "startPermissions" }
+  // ui/overlay/prompt.ts's one-line editor (rename, mkdir).
+  | { type: "promptChar"; ch: string }
+  | { type: "promptBackspace" }
+  | { type: "promptDeleteForward" }
+  | { type: "promptLeft" }
+  | { type: "promptRight" }
+  | { type: "promptHome" }
+  | { type: "promptEnd" }
+  | { type: "promptWordDelete" }
+  | { type: "promptClearToStart" }
+  | { type: "promptSubmit" }
+  // ui/overlay/confirm.ts's delete confirmation. `confirmYes` fires only for
+  // a literal `y`/`Y` — never Enter, per the plan ("a stray keypress must
+  // never destroy anything").
+  | { type: "confirmYes" }
+  | { type: "confirmCancel" }
+  // ui/overlay/permissions.ts's chmod grid.
+  | { type: "permMoveFocus"; dir: "up" | "down" | "left" | "right" }
+  | { type: "permToggle" }
+  | { type: "permDigit"; digit: number }
+  | { type: "permApply" };
 
 // ── Escape precedence ──
 
@@ -95,15 +131,120 @@ export function resolveEscape(state: AppState): Action {
   return { type: "up" };
 }
 
+// ── Phase 7 overlay input capture ──
+//
+// While a prompt/confirm/permissions overlay is open, it captures *every*
+// key except Escape (handled above, unconditionally, before any of this
+// runs) — including ones that mean something in the plain navigation table
+// below, like `r` or `q`. That is deliberate: typing "rename" into the
+// rename prompt must type the letters "r", "e", "n", "a", "m", "e", not
+// re-trigger `startRename` or quit the app. `resolveAction` checks
+// `state.overlay?.kind` for exactly this reason, ahead of the ctrl+c/ctrl+a
+// checks and the main switch.
+
+// Named keys a prompt field never types literally — everything else with
+// `ctrl: false, alt: false` is treated as a printable grapheme to insert
+// (see the `default` case in `resolvePromptKey`), which is what makes
+// CJK/emoji input "just work": `term/input.ts` hands each codepoint through
+// as `key.name` with no special casing needed here.
+const PROMPT_NON_TEXT_NAMES = new Set([
+  "up",
+  "down",
+  "left",
+  "right",
+  "pageup",
+  "pagedown",
+  "insert",
+  "f1",
+  "f2",
+  "f3",
+  "f4",
+  "f5",
+  "f6",
+  "f7",
+  "f8",
+  "f9",
+  "f10",
+  "f11",
+  "f12",
+]);
+
+function resolvePromptKey(key: Key): Action | null {
+  if (key.ctrl && key.name === "w") return { type: "promptWordDelete" };
+  if (key.ctrl && key.name === "u") return { type: "promptClearToStart" };
+  if (key.ctrl || key.alt) return null; // swallow other ctrl/alt combos while typing
+  switch (key.name) {
+    case "enter":
+      return { type: "promptSubmit" };
+    case "backspace":
+      return { type: "promptBackspace" };
+    case "delete":
+      return { type: "promptDeleteForward" };
+    case "left":
+      return { type: "promptLeft" };
+    case "right":
+      return { type: "promptRight" };
+    case "home":
+      return { type: "promptHome" };
+    case "end":
+      return { type: "promptEnd" };
+    case "space":
+      return { type: "promptChar", ch: " " };
+    case "tab":
+      return null; // no multi-field tabbing in a single-line prompt
+    default:
+      if (PROMPT_NON_TEXT_NAMES.has(key.name)) return null;
+      return { type: "promptChar", ch: key.name };
+  }
+}
+
+/**
+ * `y`/`Y` confirms; literally everything else — Enter very much included —
+ * cancels. Escape is handled before this is ever called (see the Escape
+ * precedence table), so this never has to special-case it.
+ */
+function resolveConfirmKey(key: Key): Action {
+  if (!key.ctrl && !key.alt && (key.name === "y" || key.name === "Y")) {
+    return { type: "confirmYes" };
+  }
+  return { type: "confirmCancel" };
+}
+
+function resolvePermissionsKey(key: Key): Action | null {
+  if (key.ctrl || key.alt) return null;
+  switch (key.name) {
+    case "up":
+      return { type: "permMoveFocus", dir: "up" };
+    case "down":
+      return { type: "permMoveFocus", dir: "down" };
+    case "left":
+      return { type: "permMoveFocus", dir: "left" };
+    case "right":
+      return { type: "permMoveFocus", dir: "right" };
+    case "space":
+      return { type: "permToggle" };
+    case "enter":
+      return { type: "permApply" };
+    default:
+      if (/^[0-7]$/.test(key.name)) {
+        return { type: "permDigit", digit: Number(key.name) };
+      }
+      return null;
+  }
+}
+
 // ── the rest of the bindings ──
 
 /**
  * Map one keypress to an action, or `null` when the key means nothing right
- * now. `state` is only consulted for Escape's precedence table above —
- * every other binding is a static lookup.
+ * now. `state` is consulted for Escape's precedence table above and for
+ * which overlay (if any) is open — every other binding is a static lookup.
  */
 export function resolveAction(key: Key, state: AppState): Action | null {
   if (key.name === "escape") return resolveEscape(state);
+  if (state.overlay?.kind === "prompt") return resolvePromptKey(key);
+  if (state.overlay?.kind === "confirm") return resolveConfirmKey(key);
+  if (state.overlay?.kind === "permissions") return resolvePermissionsKey(key);
   if (key.ctrl && key.name === "c") return { type: "quit" };
   if (key.ctrl && key.name === "a") return { type: "markAll" };
   // Shift+↑/↓ extends the range selection — checked ahead of the ctrl/alt
@@ -154,6 +295,15 @@ export function resolveAction(key: Key, state: AppState): Action | null {
       return { type: "cut" };
     case "p":
       return { type: "paste" };
+    case "r":
+      return { type: "startRename" };
+    case "n":
+      return { type: "startMkdir" };
+    case "d":
+    case "delete":
+      return { type: "startDelete" };
+    case "m":
+      return { type: "startPermissions" };
     case "v":
       return { type: "toggleView" };
     case ".":

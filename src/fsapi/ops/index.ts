@@ -19,10 +19,17 @@
 // `await Promise.resolve()` between them, keeps input and rendering alive
 // exactly like `ops/copy.ts` does.
 //
-// `mkdir()` is the one-liner Phase 7's `n` (new directory) prompt will call.
-// It is intentionally not recursive: flash only ever creates one directory
-// at a time, inside the directory currently being browsed, so a
-// multi-segment recursive mkdir is not a feature this app exposes.
+// `mkdir()` is the one-liner Phase 7's `n` (new directory) prompt calls. It
+// is intentionally not recursive: flash only ever creates one directory at a
+// time, inside the directory currently being browsed, so a multi-segment
+// recursive mkdir is not a feature this app exposes.
+//
+// `countTree()` is Phase 7's delete confirm's blast-radius counter — "Delete
+// 3 items, including directory 'build/' (412 files)?" needs a number from
+// somewhere. Capped and yielding for the same reason `remove()` is: an
+// uncapped recursive count over a huge tree would freeze the confirm
+// overlay before it even has a chance to show "cancel this," which defeats
+// the point of asking first.
 
 import { mkdir as fsMkdir, lstat, readdir, rm, rmdir } from "node:fs/promises";
 import { join } from "node:path";
@@ -75,4 +82,57 @@ export async function remove(
  * listing first, so `EEXIST` here means a race, not a normal path. */
 export async function mkdir(path: string): Promise<void> {
   await fsMkdir(path);
+}
+
+export type CountResult = { count: number; capped: boolean };
+
+/**
+ * Count descendants of `target` (files, symlinks, and directories — the
+ * confirm overlay's "N files" is deliberately an item count, not a
+ * byte-weighted one) recursively, depth-first, stopping the instant `count`
+ * reaches `cap` so a huge tree can't stall the caller. `target` itself is
+ * never counted, only its contents, matching "directory 'build/' (412
+ * files)" — 412 things *inside* build/, not build/ plus 412. An unreadable
+ * subdirectory (permission denied partway down) just stops descending
+ * there rather than throwing and losing the count gathered so far — the
+ * confirm overlay would rather show an undercount than no count at all.
+ */
+export async function countTree(
+  target: string,
+  cap: number,
+): Promise<CountResult> {
+  let count = 0;
+  let capped = false;
+
+  async function walk(dir: string): Promise<void> {
+    if (capped) return;
+    let children: string[];
+    try {
+      children = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const child of children) {
+      if (capped) return;
+      count++;
+      if (count >= cap) {
+        capped = true;
+        return;
+      }
+      const full = join(dir, child);
+      let isDir = false;
+      try {
+        isDir = (await lstat(full)).isDirectory();
+      } catch {
+        continue; // counted above; just can't tell if it had children of its own
+      }
+      if (isDir) {
+        await Promise.resolve(); // yield between directories — see the file header
+        await walk(full);
+      }
+    }
+  }
+
+  await walk(target);
+  return { count, capped };
 }

@@ -69,13 +69,31 @@
 // persist across navigation (see `clipboardCandidatePaths` below), so a mark
 // on a file in some other directory must survive a rescan of whatever
 // directory happens to be on screen right now.
+//
+// Phase 7 (rename, mkdir, delete, permissions) is the first thing in this
+// file that mutates a name or a mode rather than a whole file's contents.
+// Every one of its actions ends by calling `refresh()`, never `load()` — per
+// the plan, these are in-place "something changed, keep my cursor" reloads
+// exactly like the watcher's own rescans, not navigations, and going through
+// `refresh()` means a rename/mkdir/delete/chmod triggered from the keyboard
+// composes correctly with the watcher's own pending rescan instead of
+// fighting it (both ultimately call `scan()` and reconcile the same way).
+// `startRename`/`startMkdir`/`startDelete`/`startPermissions` all refuse to
+// open a second overlay on top of one that's already open (progress
+// included) — the same guard `paste()` already has for a second paste — so
+// a stray keypress during an in-flight operation can't stack overlays.
 
 import { lstatSync } from "node:fs";
-import { lstat } from "node:fs/promises";
-import { basename, dirname } from "node:path";
+import { chmod, rename as fsRename, lstat } from "node:fs/promises";
+import { basename, dirname, join } from "node:path";
 import type { Entry } from "../fsapi/entry.ts";
-import type { CutOutcome, PasteOutcome } from "../fsapi/ops/queue.ts";
-import { runCutJob, runPasteJob } from "../fsapi/ops/queue.ts";
+import { countTree, mkdir } from "../fsapi/ops/index.ts";
+import type {
+  CutOutcome,
+  DeleteOutcome,
+  PasteOutcome,
+} from "../fsapi/ops/queue.ts";
+import { runCutJob, runDeleteJob, runPasteJob } from "../fsapi/ops/queue.ts";
 import {
   DEFAULT_SORT,
   SORT_KEYS,
@@ -84,7 +102,19 @@ import {
   scan,
   sortEntries,
 } from "../fsapi/scan.ts";
-import { stringWidth } from "../term/width.ts";
+import { graphemes, stringWidth } from "../term/width.ts";
+import {
+  backspace as fieldBackspace,
+  clearToStart as fieldClearToStart,
+  deleteForward as fieldDeleteForward,
+  deleteWordBack as fieldDeleteWordBack,
+  insertChar as fieldInsertChar,
+  moveEnd as fieldMoveEnd,
+  moveHome as fieldMoveHome,
+  moveLeft as fieldMoveLeft,
+  moveRight as fieldMoveRight,
+  validateName,
+} from "../ui/overlay/prompt.ts";
 
 // ── types ──
 
@@ -111,6 +141,49 @@ export type Overlay =
       currentPath: string;
       bytesDone: number;
       bytesTotal: number;
+    }
+  /**
+   * Phase 7's rename/mkdir editor. `originalName`/`originalPath` are set
+   * only for `mode: "rename"` — `mkdir` has no source entry to rename and
+   * leaves both `null`. `error` is recomputed on every keystroke (see
+   * `updatePromptField` below) so validation is inline, not deferred to
+   * Enter.
+   */
+  | {
+      kind: "prompt";
+      mode: "rename" | "mkdir";
+      value: string;
+      cursor: number;
+      error: string | null;
+      originalName: string | null;
+      originalPath: string | null;
+    }
+  /**
+   * Phase 7's delete confirmation. `message` is the fully-formatted
+   * blast-radius sentence (`buildDeleteMessage` below); `paths` is the
+   * already-filtered target list `confirmDelete` will act on.
+   */
+  | { kind: "confirm"; message: string; paths: string[] }
+  /**
+   * Phase 7's chmod editor. `rwxBits` (0..0o777) is the live 3x3 grid state;
+   * `specialBits` (0..0o7) is the suid/sgid/sticky triple shown in the
+   * read-only fourth row. `specialExplicit` starts false — meaning "preserve
+   * whatever special bits each target already has" — and only becomes true
+   * once the user has typed a full 4-digit octal (`digitCount >= 4`), at
+   * which point `specialBits` is applied to every target instead. See
+   * `applyPermissions` for exactly how that combines with each target's own
+   * mode — this is the file the plan's "3x3 grid silently destroys setuid/
+   * setgid/sticky" risk is about.
+   */
+  | {
+      kind: "permissions";
+      paths: string[];
+      rwxBits: number;
+      specialBits: number;
+      specialExplicit: boolean;
+      digitCount: number;
+      focus: number;
+      error: string | null;
     };
 
 export type AppState = {
@@ -144,6 +217,12 @@ const MESSAGE_TTL_MS = 4000;
 // tap land on the next untouched entry instead of re-toggling the same one.
 const MARK_ADVANCE = 1;
 
+// The delete confirm overlay's blast-radius count (`buildDeleteMessage`)
+// stops walking a tree once it has counted this many descendants and shows
+// "N+" instead — the plan's "cap the counting so a huge tree can't freeze
+// the UI" requirement.
+const DELETE_COUNT_CAP = 1000;
+
 // ── Store ──
 
 export class Store {
@@ -164,6 +243,12 @@ export class Store {
   // superseded call can never be mistaken for the current one — see the
   // `pasteAbort !== abort` check in `paste()`'s onProgress callback.
   private pasteAbort: AbortController | null = null;
+  // Same shape as `pasteAbort`, for Phase 7's delete job — a separate field
+  // (not a reuse of `pasteAbort`) because the two operations are
+  // conceptually distinct even though `ops/queue.ts`'s `jobInFlight` flag
+  // already guarantees only one of them ever runs at a time. `closeOverlay`
+  // (main.ts) aborts whichever of the two is actually set.
+  private deleteAbort: AbortController | null = null;
 
   constructor(init: StoreInit) {
     this.state = {
@@ -782,6 +867,19 @@ export class Store {
     this.pasteAbort?.abort();
   }
 
+  /**
+   * Esc while the progress overlay is open, Phase 7 version — main.ts's
+   * `closeOverlay` case calls this instead of `cancelPaste()` for a
+   * "Deleting" progress overlay. Aborts whichever of `pasteAbort`/
+   * `deleteAbort` is actually set; harmless to call both since at most one
+   * is ever non-null (`ops/queue.ts`'s `jobInFlight` guarantees only one
+   * job runs at a time).
+   */
+  cancelOperation(): void {
+    this.pasteAbort?.abort();
+    this.deleteAbort?.abort();
+  }
+
   private reportPasteOutcome(
     outcome: PasteOutcome,
     vanishedCount: number,
@@ -843,6 +941,506 @@ export class Store {
     );
   }
 
+  // ── rename / mkdir (Phase 7) ──
+
+  /**
+   * Open the rename prompt, pre-filled with the cursor entry's current
+   * name and the cursor placed after it — SPEC asks for "extension not
+   * selected," which this satisfies simply by never pre-selecting anything
+   * (there is no selection concept in this one-line editor at all); the
+   * user can Home and retype the extension if they want it gone. Refuses
+   * on the synthetic ".." row (never rename it) and while any overlay is
+   * already open, the same guard `paste()` uses against a second paste.
+   */
+  startRename(): void {
+    if (this.state.overlay) return;
+    const list = this.visibleEntries();
+    const entry = list[this.state.cursor];
+    if (!entry || entry.name === "..") return;
+    this.state.overlay = {
+      kind: "prompt",
+      mode: "rename",
+      value: entry.name,
+      cursor: graphemes(entry.name).length,
+      error: null,
+      originalName: entry.name,
+      originalPath: entry.path,
+    };
+    this.notify();
+  }
+
+  /** Open the mkdir prompt, empty. Same already-open guard as `startRename`. */
+  startMkdir(): void {
+    if (this.state.overlay) return;
+    this.state.overlay = {
+      kind: "prompt",
+      mode: "mkdir",
+      value: "",
+      cursor: 0,
+      error: null,
+      originalName: null,
+      originalPath: null,
+    };
+    this.notify();
+  }
+
+  /**
+   * Run one pure field-editing function (`ui/overlay/prompt.ts`'s
+   * `insertChar`/`backspace`/etc.) against the open prompt and re-validate
+   * on every call, so the inline error tracks the field live instead of
+   * only appearing once Enter is pressed (per the task's "show the reason
+   * inline rather than silently refusing").
+   */
+  private updatePromptField(
+    edit: (f: { value: string; cursor: number }) => {
+      value: string;
+      cursor: number;
+    },
+  ): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "prompt") return;
+    const next = edit({ value: overlay.value, cursor: overlay.cursor });
+    overlay.value = next.value;
+    overlay.cursor = next.cursor;
+    overlay.error = validateName(
+      overlay.value,
+      new Set(this.state.entries.map((e) => e.name)),
+      overlay.originalName ?? undefined,
+    );
+    this.notify();
+  }
+
+  promptInsertChar(ch: string): void {
+    this.updatePromptField((f) => fieldInsertChar(f, ch));
+  }
+  promptBackspace(): void {
+    this.updatePromptField(fieldBackspace);
+  }
+  promptDeleteForward(): void {
+    this.updatePromptField(fieldDeleteForward);
+  }
+  promptMoveLeft(): void {
+    this.updatePromptField(fieldMoveLeft);
+  }
+  promptMoveRight(): void {
+    this.updatePromptField(fieldMoveRight);
+  }
+  promptMoveHome(): void {
+    this.updatePromptField(fieldMoveHome);
+  }
+  promptMoveEnd(): void {
+    this.updatePromptField(fieldMoveEnd);
+  }
+  promptDeleteWordBack(): void {
+    this.updatePromptField(fieldDeleteWordBack);
+  }
+  promptClearToStart(): void {
+    this.updatePromptField(fieldClearToStart);
+  }
+
+  /** Esc on the prompt overlay — a bare dismiss, nothing to abort. */
+  cancelPrompt(): void {
+    if (this.state.overlay?.kind !== "prompt") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  /**
+   * Enter on the rename/mkdir prompt. `mkdir` goes through
+   * `fsapi/ops/index.ts`'s `mkdir()`, whose `EEXIST` on the caller's behalf
+   * IS the race check the plan asks for ("catching the race where the
+   * target appeared since the last scan") — the inline validation above
+   * already checked the listing, this catches anything that changed since.
+   *
+   * `rename` has no such backstop: verified in Phase 5b,
+   * `fs.promises.rename` silently overwrites an existing target — the same
+   * bug class as that phase's move code, just reachable here from the
+   * keyboard instead of a paste. So this re-checks the destination with a
+   * fresh `lstat` immediately before calling `rename`, closing the window
+   * between "the listing was read" and "Enter was pressed" as tightly as a
+   * non-atomic check can (Node exposes no `RENAME_NOREPLACE`). An unchanged
+   * rename (new name equals the original) is a silent no-op close rather
+   * than an error or a real `rename` call.
+   */
+  async submitPrompt(): Promise<void> {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "prompt") return;
+
+    const name = overlay.value;
+    const err = validateName(
+      name,
+      new Set(this.state.entries.map((e) => e.name)),
+      overlay.originalName ?? undefined,
+    );
+    if (err) {
+      overlay.error = err;
+      this.notify();
+      return;
+    }
+
+    if (overlay.mode === "mkdir") {
+      try {
+        await mkdir(join(this.state.cwd, name));
+      } catch (mkdirErr) {
+        overlay.error = `could not create '${name}': ${errorMessage(mkdirErr)}`;
+        this.notify();
+        return;
+      }
+      this.state.overlay = null;
+      this.setMessage(`created '${name}'`);
+      await this.refresh(this.state.cwd);
+      return;
+    }
+
+    // rename
+    if (name === overlay.originalName) {
+      this.state.overlay = null;
+      this.notify();
+      return;
+    }
+    const destPath = join(this.state.cwd, name);
+    try {
+      await lstat(destPath);
+      // Something is there that wasn't in the listing this prompt was
+      // opened against — the race the method comment describes.
+      overlay.error = `'${name}' already exists`;
+      this.notify();
+      return;
+    } catch {
+      // ENOENT — good, nothing there. Fall through to the real rename.
+    }
+    const srcPath = overlay.originalPath;
+    if (!srcPath) return; // unreachable: rename mode always sets originalPath
+    try {
+      await fsRename(srcPath, destPath);
+    } catch (renameErr) {
+      overlay.error = errorMessage(renameErr);
+      this.notify();
+      return;
+    }
+    this.state.overlay = null;
+    this.setMessage(`renamed to '${name}'`);
+    await this.refresh(this.state.cwd);
+  }
+
+  // ── delete (Phase 7) ──
+
+  /**
+   * Open the delete confirmation, built around the exact blast-radius
+   * sentence the plan asks for: "Delete 3 items, including directory
+   * 'build/' (412 files)?" — see `buildDeleteMessage`. Targets are the
+   * marked set, or the cursor entry when nothing is marked, same as copy/
+   * cut (`clipboardCandidatePaths`) — minus anything that equals the
+   * current directory itself. That last filter matters because marks
+   * persist across navigation: marking a directory, `cd`-ing into it, and
+   * pressing delete is a real way to end up with the cwd itself as a
+   * target, which the plan explicitly forbids ("refuse to delete the
+   * current directory itself"). The synthetic ".." row can never appear
+   * here at all — `clipboardCandidatePaths` already excludes it, the same
+   * way it's excluded from marking in the first place.
+   */
+  async startDelete(): Promise<void> {
+    if (this.state.overlay) return;
+    const all = this.clipboardCandidatePaths();
+    if (all.length === 0) {
+      this.setMessage("nothing to delete");
+      return;
+    }
+    const targets = all.filter((p) => p !== this.state.cwd);
+    if (targets.length < all.length) {
+      this.setMessage("cannot delete the current directory", "error");
+    }
+    if (targets.length === 0) return;
+
+    const message = await this.buildDeleteMessage(targets);
+    if (this.state.overlay) return; // an overlay could have opened during the count above
+    this.state.overlay = { kind: "confirm", message, paths: targets };
+    this.notify();
+  }
+
+  /**
+   * One directory's contents get counted, capped, for the blast-radius
+   * text — never all of them when several are selected, and never
+   * uncapped, so a huge tree can't freeze this overlay before it even
+   * opens (`countTree`'s own cap, `DELETE_COUNT_CAP`).
+   */
+  private async buildDeleteMessage(paths: string[]): Promise<string> {
+    const infos = await Promise.all(
+      paths.map(async (p) => {
+        try {
+          const st = await lstat(p);
+          return { path: p, isDir: st.isDirectory() };
+        } catch {
+          return { path: p, isDir: false };
+        }
+      }),
+    );
+
+    const countText = async (dirPath: string): Promise<string> => {
+      const { count, capped } = await countTree(dirPath, DELETE_COUNT_CAP);
+      return capped ? `${count}+` : `${count}`;
+    };
+
+    if (infos.length === 1) {
+      const info = infos[0];
+      if (!info) return "Delete this item?";
+      const name = basename(info.path);
+      if (!info.isDir) return `Delete '${name}'?`;
+      const n = await countText(info.path);
+      return `Delete directory '${name}/' (${n} file${n === "1" ? "" : "s"})?`;
+    }
+
+    const n = infos.length;
+    const dir = infos.find((i) => i.isDir);
+    if (!dir) return `Delete ${n} items?`;
+    const dirName = basename(dir.path);
+    const count = await countText(dir.path);
+    return `Delete ${n} items, including directory '${dirName}/' (${count} file${count === "1" ? "" : "s"})?`;
+  }
+
+  /**
+   * `y` on the delete confirm (see keymap.ts's `resolveConfirmKey` — `y` is
+   * the only key that reaches this). Runs through `ops/queue.ts`'s
+   * `runDeleteJob`, which shares the paste/cut job queue's single
+   * `jobInFlight` flag, so this stays cancellable via the same progress
+   * overlay and suppresses the watcher's rescan exactly like a paste does.
+   * Marks are dropped for every path actually deleted, regardless of which
+   * directory it lived in — unlike `refresh()`'s own mark-pruning (scoped
+   * to the directory being rescanned), a delete's targets can span several
+   * directories via the marked set, so this has to do it explicitly rather
+   * than relying on refresh() to catch them all.
+   */
+  async confirmDelete(): Promise<void> {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "confirm") return;
+    const paths = overlay.paths;
+
+    const abort = new AbortController();
+    this.deleteAbort = abort;
+    this.state.overlay = {
+      kind: "progress",
+      label: "Deleting",
+      done: 0,
+      total: paths.length,
+      currentPath: "",
+      bytesDone: 0,
+      bytesTotal: 0,
+    };
+    this.notify();
+
+    let outcome: DeleteOutcome;
+    try {
+      outcome = await runDeleteJob({
+        sources: paths,
+        signal: abort.signal,
+        onProgress: (p) => {
+          if (this.deleteAbort !== abort) return;
+          this.state.overlay = {
+            kind: "progress",
+            label: "Deleting",
+            done: p.done,
+            total: p.total,
+            currentPath: p.currentPath,
+            bytesDone: 0,
+            bytesTotal: 0,
+          };
+          this.notify();
+        },
+      });
+    } finally {
+      if (this.deleteAbort === abort) this.deleteAbort = null;
+    }
+
+    this.state.overlay = null;
+    for (const p of outcome.deletedSources) this.state.marked.delete(p);
+    this.reportDeleteOutcome(outcome);
+    await this.refresh(this.state.cwd);
+  }
+
+  /**
+   * Anything but `y` on the delete confirm, including Enter — deliberately
+   * NOT the accept key, per the plan ("a stray keypress must never destroy
+   * anything"). Also reached via Escape (closeOverlay).
+   */
+  cancelDelete(): void {
+    if (this.state.overlay?.kind !== "confirm") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  private reportDeleteOutcome(outcome: DeleteOutcome): void {
+    const parts: string[] = [];
+    if (outcome.cancelled) {
+      parts.push("delete cancelled");
+    } else if (outcome.deletedSources.length > 0) {
+      const n = outcome.deletedSources.length;
+      parts.push(`deleted ${n} item${n === 1 ? "" : "s"}`);
+    }
+    if (outcome.errors.length > 0) {
+      parts.push(
+        `${outcome.errors.length} error${outcome.errors.length === 1 ? "" : "s"}`,
+      );
+    }
+    const kind: Message["kind"] = outcome.errors.length > 0 ? "error" : "info";
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing deleted",
+      kind,
+    );
+  }
+
+  // ── permissions / chmod (Phase 7) ──
+
+  /**
+   * Open the chmod editor, seeded from the first target's already-scanned
+   * `mode` — no fresh `lstat` needed, `Entry.mode` is already on hand from
+   * the last scan, so unlike `startDelete` this is synchronous. Targets are
+   * the marked set, or the cursor entry when nothing is marked, same as
+   * copy/cut/delete.
+   *
+   * `specialExplicit` starts false: until the user types a full 4-digit
+   * octal, `applyPermissions` re-reads and preserves each target's OWN
+   * suid/sgid/sticky bits rather than stamping every target with whatever
+   * this one seed file happened to have when the overlay opened — see
+   * `applyPermissions` for why that distinction is the whole point of this
+   * overlay.
+   */
+  startPermissions(): void {
+    if (this.state.overlay) return;
+    const paths = this.clipboardCandidatePaths();
+    if (paths.length === 0) {
+      this.setMessage("nothing to change permissions on");
+      return;
+    }
+    const list = this.visibleEntries();
+    const seed = list.find((e) => e.path === paths[0]);
+    const seedMode = seed?.mode ?? 0o644;
+    this.state.overlay = {
+      kind: "permissions",
+      paths,
+      rwxBits: seedMode & 0o777,
+      specialBits: (seedMode >> 9) & 0o7,
+      specialExplicit: false,
+      digitCount: 0,
+      focus: 0,
+      error: null,
+    };
+    this.notify();
+  }
+
+  /** Arrow keys in the chmod grid: row = user/group/other, col = r/w/x. */
+  permMoveFocus(dir: "up" | "down" | "left" | "right"): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "permissions") return;
+    let row = Math.floor(overlay.focus / 3);
+    let col = overlay.focus % 3;
+    if (dir === "up") row = Math.max(0, row - 1);
+    else if (dir === "down") row = Math.min(2, row + 1);
+    else if (dir === "left") col = Math.max(0, col - 1);
+    else col = Math.min(2, col + 1);
+    overlay.focus = row * 3 + col;
+    this.notify();
+  }
+
+  /**
+   * Space: flip the focused checkbox. This only ever touches `rwxBits`
+   * (the low 9 bits) — it can never move a bit into or out of
+   * `specialBits`, which is exactly what keeps the grid safe by default per
+   * the plan's warning that a naive 3x3 grid silently destroys setuid/
+   * setgid/sticky.
+   */
+  permToggle(): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "permissions") return;
+    const bitPos = 8 - overlay.focus; // focus 0 (user r) -> bit 8 (0o400) ... focus 8 (other x) -> bit 0 (0o1)
+    overlay.rwxBits ^= 1 << bitPos;
+    this.notify();
+  }
+
+  /**
+   * A digit key 0-7: shift it into a rolling 12-bit accumulator, the same
+   * way a calculator display works — typing "7", "5", "5" in sequence
+   * builds 0o755 exactly like typing on a `chmod` command line, and a 4th
+   * leading digit sets the special-bit triple explicitly (`chmod 4755`
+   * sets setuid; plain `chmod 755` — only 3 digits — clears it, matching
+   * real `chmod` semantics). `specialExplicit` flips true once that 4th
+   * digit lands, which is what tells `applyPermissions` to use the typed
+   * `specialBits` on every target instead of preserving each one's own.
+   */
+  permDigit(digit: number): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "permissions") return;
+    const current = (overlay.specialBits << 9) | overlay.rwxBits;
+    const next = ((current << 3) | (digit & 0o7)) & 0o7777;
+    overlay.rwxBits = next & 0o777;
+    overlay.specialBits = (next >> 9) & 0o7;
+    overlay.digitCount += 1;
+    if (overlay.digitCount >= 4) overlay.specialExplicit = true;
+    this.notify();
+  }
+
+  /** Esc on the permissions overlay — a bare dismiss, nothing to abort. */
+  cancelPermissions(): void {
+    if (this.state.overlay?.kind !== "permissions") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  /**
+   * Enter: apply to every target. This is the plan's named risk, and the
+   * fix: `chmod(path, gridValue)` naively clears the high three bits
+   * (setuid/setgid/sticky), silently breaking an sgid-shared directory with
+   * no feedback. Instead, for each target whose special bits are being
+   * *preserved* (`!specialExplicit`), this re-reads THAT target's own
+   * current mode and keeps ITS special bits — `(st.mode & ~0o777) |
+   * rwxBits` — rather than reusing the seed file's special bits from when
+   * the overlay opened. That is what makes a batch chmod safe even across
+   * targets that started with different suid/sgid/sticky bits: only the
+   * bits the grid actually exposes and edits (the low 9) ever change for
+   * them. When the user did type a full 4-digit octal (`specialExplicit`),
+   * every target gets that exact special-bit value instead — the same
+   * thing a real `chmod 4755 *` does.
+   *
+   * Per-entry failures (EPERM on a file you don't own, ENOENT on one that
+   * vanished) are collected and reported by count; they never abort the
+   * rest of the batch.
+   */
+  async applyPermissions(): Promise<void> {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "permissions") return;
+    const { paths, rwxBits, specialBits, specialExplicit } = overlay;
+
+    let succeeded = 0;
+    const failures: string[] = [];
+    for (const path of paths) {
+      try {
+        const st = await lstat(path);
+        const newMode = specialExplicit
+          ? (st.mode & ~0o7777) | (specialBits << 9) | rwxBits
+          : (st.mode & ~0o777) | rwxBits;
+        await chmod(path, newMode);
+        succeeded++;
+      } catch (chmodErr) {
+        failures.push(`${basename(path)}: ${errorMessage(chmodErr)}`);
+      }
+    }
+
+    this.state.overlay = null;
+    const parts: string[] = [];
+    if (succeeded > 0) {
+      parts.push(
+        `changed permissions on ${succeeded} item${succeeded === 1 ? "" : "s"}`,
+      );
+    }
+    if (failures.length > 0) {
+      parts.push(`${failures.length} failed`);
+    }
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing changed",
+      failures.length > 0 ? "error" : "info",
+    );
+    await this.refresh(this.state.cwd);
+  }
+
   // ── messages ──
 
   setMessage(text: string, kind: Message["kind"] = "info"): void {
@@ -858,6 +1456,11 @@ export class Store {
 }
 
 // ── helpers ──
+
+/** `err.message` for an `Error`, `String(err)` otherwise — same small helper main.ts keeps for the same reason. */
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
 /**
  * Split `paths` into those that still `lstat` successfully and those that
