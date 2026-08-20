@@ -12,10 +12,12 @@
 //   2. Marks exist -> clear them.
 //   3. Browsing an archive at its root -> leave the archive.
 //   4. Otherwise -> go up one directory.
-// Only arm 4 is reachable in Phase 2 — there are no overlays, marks, or
-// archives yet — but the table is written in full now so Phase 4 (marks),
-// Phase 7 (overlays), and Phase 8 (archives) each slot in by editing one
-// guard function, not by restructuring this file.
+// Arms 2 and 4 are reachable as of Phase 4 (marks are real now); arm 1
+// (overlays, Phase 7) and arm 3 (archives, Phase 8) are still unreachable —
+// but the table was written in full back in Phase 2 so each later phase
+// slots in by editing one guard function, not by restructuring this file.
+// Phase 4 itself needed no change here at all: `s.marked.size > 0` was
+// already the guard.
 //
 // `h` and `Backspace` bypass this table entirely and always go up, so there
 // is always a way to navigate that never depends on Escape's state. `←`
@@ -45,9 +47,17 @@ export type Action =
   | { type: "toggleSortReverse" }
   | { type: "help" }
   | { type: "quit" }
-  // Escape-precedence arms with no handler yet — later phases give these
-  // real behavior in app.ts/main.ts; today they are unreachable (see the
-  // guards below) but typed so the table above compiles against them.
+  // Phase 4: selection and clipboard. `toggleMark` also advances the
+  // cursor (see state/store.ts's `MARK_ADVANCE`); `extendSelection` carries
+  // the arrow direction so the Shift+↑/↓ range anchor extends the right way.
+  | { type: "toggleMark" }
+  | { type: "extendSelection"; dir: "up" | "down" }
+  | { type: "markAll" }
+  | { type: "copy" }
+  | { type: "cut" }
+  // Escape-precedence arms. `clearMarks` is live as of Phase 4; `closeOverlay`
+  // (Phase 7) and `leaveArchive` (Phase 8) are still unreachable today (see
+  // the guards below) but typed so the table above compiles against them.
   | { type: "closeOverlay" }
   | { type: "clearMarks" }
   | { type: "leaveArchive" };
@@ -86,6 +96,13 @@ export function resolveEscape(state: AppState): Action {
 export function resolveAction(key: Key, state: AppState): Action | null {
   if (key.name === "escape") return resolveEscape(state);
   if (key.ctrl && key.name === "c") return { type: "quit" };
+  if (key.ctrl && key.name === "a") return { type: "markAll" };
+  // Shift+↑/↓ extends the range selection — checked ahead of the ctrl/alt
+  // early-return below (shift is its own flag, unrelated to it) and ahead
+  // of the plain arrow-key cases, which a bare ↑/↓ still falls through to.
+  if (key.shift && (key.name === "up" || key.name === "down")) {
+    return { type: "extendSelection", dir: key.name };
+  }
   if (key.ctrl || key.alt) return null;
 
   switch (key.name) {
@@ -120,6 +137,12 @@ export function resolveAction(key: Key, state: AppState): Action | null {
     case "h":
     case "backspace":
       return { type: "up" };
+    case "tab":
+      return { type: "toggleMark" };
+    case "c":
+      return { type: "copy" };
+    case "x":
+      return { type: "cut" };
     case "v":
       return { type: "toggleView" };
     case ".":

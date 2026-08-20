@@ -142,6 +142,188 @@ describe("header/data column alignment", () => {
   });
 });
 
+// ── Phase 4: selection & clipboard status rendering ──
+//
+// The status column sits at screen column 1 (right after the cursor marker
+// at column 0) — see ui/listView.ts's file header for why that column was
+// free to reuse. Plain-text assertions here (`renderPlainText()`, no SGR at
+// all) are exactly what `--dump-frame` without `--color` shows, so they
+// double as the colour-blind/plain-text-safety check the plan asks for.
+
+const ESC = "\x1b";
+const sgrRe = new RegExp(`${ESC}\\[[0-9;]*m`, "g");
+
+function firstLine(screen: Screen): string {
+  return screen.renderPlainText().split("\n")[0] ?? "";
+}
+
+describe("selection & clipboard status rendering", () => {
+  const layout = computeListLayout(100);
+
+  it("shows '*' in the status column for a marked entry", () => {
+    const screen = new Screen(100, 2, () => {});
+    const entry = makeEntry("marked-file.txt");
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set([entry.path]),
+    );
+    expect(firstLine(screen)[1]).toBe("*");
+  });
+
+  it("shows 'x' for a cut entry and '+' for a copied one", () => {
+    const cutEntry = makeEntry("cut-file.txt");
+    const cutScreen = new Screen(100, 2, () => {});
+    renderListView(
+      cutScreen,
+      0,
+      0,
+      100,
+      1,
+      [cutEntry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      { mode: "cut", paths: [cutEntry.path] },
+    );
+    expect(firstLine(cutScreen)[1]).toBe("x");
+
+    const copiedEntry = makeEntry("copied-file.txt");
+    const copyScreen = new Screen(100, 2, () => {});
+    renderListView(
+      copyScreen,
+      0,
+      0,
+      100,
+      1,
+      [copiedEntry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      { mode: "copy", paths: [copiedEntry.path] },
+    );
+    expect(firstLine(copyScreen)[1]).toBe("+");
+  });
+
+  it("shows both the cursor marker and the mark glyph at once on a marked cursor row", () => {
+    const screen = new Screen(100, 2, () => {});
+    const entry = makeEntry("both.txt");
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      0, // cursor is on this row too
+      0,
+      layout,
+      "ascii",
+      new Set([entry.path]),
+    );
+    const line = firstLine(screen);
+    expect(line[0]).toBe("›");
+    expect(line[1]).toBe("*");
+  });
+
+  it("clipboard membership wins over a plain mark for the same path", () => {
+    const screen = new Screen(100, 2, () => {});
+    const entry = makeEntry("marked-and-cut.txt");
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set([entry.path]), // also marked...
+      { mode: "cut", paths: [entry.path] }, // ...but cut is what shows
+    );
+    expect(firstLine(screen)[1]).toBe("x");
+  });
+
+  it("never shows a status glyph for the synthetic '..' row", () => {
+    const screen = new Screen(100, 2, () => {});
+    // Deliberately give ".." the same path as something in `marked` — the
+    // row must still render blank; ".." is never markable in the first place.
+    const dotdot = makeEntry("..", { path: "/tmp/parent" });
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [dotdot],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(["/tmp/parent"]),
+    );
+    expect(firstLine(screen)[1]).toBe(" ");
+  });
+
+  it("dims and italicizes a cut row's content; dims only for a copied row", () => {
+    // A plain, uncategorized file has no fg color of its own (colorFor ->
+    // undefined), so the emitted SGR for its icon/name text carries only
+    // reset + attr codes — no color tokens to make the assertion ambiguous.
+    const cutEntry = makeEntry("plain-cut.txt");
+    const cutScreen = new Screen(100, 1, () => {});
+    renderListView(
+      cutScreen,
+      0,
+      0,
+      100,
+      1,
+      [cutEntry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      { mode: "cut", paths: [cutEntry.path] },
+    );
+    const cutOut = cutScreen.flush();
+    expect(cutOut.match(sgrRe)).toContain(`${ESC}[0;2;3m`);
+
+    const copiedEntry = makeEntry("plain-copied.txt");
+    const copyScreen = new Screen(100, 1, () => {});
+    renderListView(
+      copyScreen,
+      0,
+      0,
+      100,
+      1,
+      [copiedEntry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      { mode: "copy", paths: [copiedEntry.path] },
+    );
+    const copyOut = copyScreen.flush();
+    expect(copyOut.match(sgrRe)).toContain(`${ESC}[0;2m`);
+    expect(copyOut).not.toContain(`${ESC}[0;2;3m`);
+  });
+});
+
 describe("no dot leader", () => {
   it("fills the gap after a short name with plain whitespace, not a leader glyph", () => {
     const width = 100;

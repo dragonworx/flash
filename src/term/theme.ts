@@ -49,6 +49,12 @@ export const colors = {
   // A faint band under the status bar so it reads as a footer rather than a
   // stray last line.
   footerBg: 0x1b2430,
+  // Selection/clipboard status glyph colors (see `rowMarkState` below) —
+  // deliberately distinct from every file-category color above so a marked,
+  // cut, or copied row is never mistaken for a file type.
+  marked: 0xf6c945,
+  cut: 0xff8c42,
+  copied: 0xa78bfa,
 } as const;
 
 // ── file categorisation ──
@@ -207,4 +213,62 @@ export function colorFor(entry: Entry): number | undefined {
 
 export function isIconSet(value: string): value is IconSet {
   return (ICON_SETS as string[]).includes(value);
+}
+
+// ── selection & clipboard status ──
+//
+// The single status glyph ui/listView.ts and ui/gridView.ts draw in the
+// column immediately after the cursor marker (previously always blank —
+// see those files' MARKER_WIDTH) — independent of `--icons`, exactly like
+// the cursor's `›`, so it renders identically under any icon set. Clipboard
+// membership wins over a plain mark: once a path is staged for copy or cut
+// that is the more actionable thing to show on the row, and the aggregate
+// "N marked" / "M cut" counts in the status bar (ui/chrome.ts) still tell
+// the whole story for marks that fall outside the staged range.
+
+export type RowMarkState = "none" | "marked" | "cut" | "copied";
+
+/**
+ * Combined mark/clipboard status for one entry's absolute path. Takes the
+ * clipboard as a small structural type rather than importing
+ * `state/store.ts`'s `AppState` — this file has no state-layer dependency,
+ * and `state/store.ts`'s own file header is explicit that avoiding that
+ * kind of cross-import is what keeps the module graph acyclic.
+ */
+export function rowMarkState(
+  path: string,
+  marked: ReadonlySet<string>,
+  clipboard: { mode: "copy" | "cut"; paths: string[] } | null,
+): RowMarkState {
+  if (clipboard?.paths.includes(path)) {
+    return clipboard.mode === "cut" ? "cut" : "copied";
+  }
+  return marked.has(path) ? "marked" : "none";
+}
+
+/**
+ * The status glyph itself: ASCII-safe and visually distinct from the
+ * cursor's `›`, so it survives `--no-color` and `--icons=ascii` alike —
+ * and mnemonic where possible ('x' cut, '+' copied) to match the key that
+ * put the entry there.
+ */
+export const MARK_GLYPH: Record<RowMarkState, string> = {
+  none: " ",
+  marked: "*",
+  cut: "x",
+  copied: "+",
+};
+
+/** Foreground color for the status glyph; `undefined` (terminal default) for "none". */
+export function markColor(state: RowMarkState): number | undefined {
+  switch (state) {
+    case "marked":
+      return colors.marked;
+    case "cut":
+      return colors.cut;
+    case "copied":
+      return colors.copied;
+    default:
+      return undefined;
+  }
 }

@@ -4,12 +4,30 @@
 // `nameWidths: number[]` rather than `Entry[]`).
 
 import { describe, expect, it } from "bun:test";
+import type { Entry } from "../src/fsapi/entry.ts";
+import { Screen } from "../src/term/screen.ts";
 import {
   clampGridScroll,
   computeGridLayout,
   gridRowCount,
   moveGridCursor,
+  renderGridView,
 } from "../src/ui/gridView.ts";
+
+function makeEntry(name: string, overrides: Partial<Entry> = {}): Entry {
+  return {
+    name,
+    path: `/tmp/${name}`,
+    kind: "file",
+    size: 123,
+    mode: 0o100644,
+    uid: 1000,
+    gid: 1000,
+    mtimeMs: Date.now() - 60_000,
+    width: name.length,
+    ...overrides,
+  };
+}
 
 describe("computeGridLayout", () => {
   it("returns nothing for an empty entry list or non-positive width", () => {
@@ -147,5 +165,118 @@ describe("clampGridScroll", () => {
 
   it("clamps to 0 for a non-positive viewport", () => {
     expect(clampGridScroll(5, 5, 0, 20)).toBe(0);
+  });
+});
+
+// ── Phase 4: selection & clipboard status rendering ──
+//
+// The grid reuses the same marker-column convention as the list view (see
+// ui/gridView.ts's file header): status glyph at screen column 1, right
+// after the cursor marker at column 0. Plain-text assertions here
+// (`renderPlainText()`) are exactly what `--dump-frame` without `--color`
+// shows.
+
+function firstLine(screen: Screen): string {
+  return screen.renderPlainText().split("\n")[0] ?? "";
+}
+
+describe("renderGridView: selection & clipboard status", () => {
+  it("shows '*' for a marked cell, in the column right after the cursor marker", () => {
+    const entry = makeEntry("marked.txt");
+    const screen = new Screen(40, 2, () => {});
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set([entry.path]),
+    );
+    expect(firstLine(screen)[1]).toBe("*");
+  });
+
+  it("shows 'x' for a cut cell and '+' for a copied one", () => {
+    const cutEntry = makeEntry("cut.txt");
+    const cutScreen = new Screen(40, 2, () => {});
+    renderGridView(
+      cutScreen,
+      0,
+      0,
+      40,
+      1,
+      [cutEntry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      { mode: "cut", paths: [cutEntry.path] },
+    );
+    expect(firstLine(cutScreen)[1]).toBe("x");
+
+    const copiedEntry = makeEntry("copied.txt");
+    const copyScreen = new Screen(40, 2, () => {});
+    renderGridView(
+      copyScreen,
+      0,
+      0,
+      40,
+      1,
+      [copiedEntry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      { mode: "copy", paths: [copiedEntry.path] },
+    );
+    expect(firstLine(copyScreen)[1]).toBe("+");
+  });
+
+  it("shows both the cursor marker and the mark glyph on a marked cursor cell", () => {
+    const entry = makeEntry("both.txt");
+    const screen = new Screen(40, 2, () => {});
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      0, // cursor on this (the only) cell
+      0,
+      "ascii",
+      new Set([entry.path]),
+    );
+    const line = firstLine(screen);
+    expect(line[0]).toBe("›");
+    expect(line[1]).toBe("*");
+  });
+
+  it("never shows a status glyph for the synthetic '..' cell", () => {
+    const dotdot = makeEntry("..", { path: "/tmp/parent" });
+    const screen = new Screen(40, 2, () => {});
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [dotdot],
+      -1,
+      0,
+      "ascii",
+      new Set(["/tmp/parent"]),
+    );
+    expect(firstLine(screen)[1]).toBe(" ");
+  });
+
+  it("renders an unmarked, non-clipboard cell with a blank status column", () => {
+    const entry = makeEntry("plain.txt");
+    const screen = new Screen(40, 2, () => {});
+    renderGridView(screen, 0, 0, 40, 1, [entry], -1, 0, "ascii");
+    expect(firstLine(screen)[1]).toBe(" ");
   });
 });

@@ -6,7 +6,8 @@
 // runs the browser: input -> keymap -> Store -> render, wired into the
 // event-driven dirty-flag loop from Phase 1. See
 // /home/dev/.claude/plans/expressive-discovering-squid.md, "Phase 3" and the
-// visual-design/grid/config-persistence expansion of it.
+// visual-design/grid/config-persistence expansion of it, plus "Phase 4"
+// (selection and clipboard) for the mark/copy/cut wiring below.
 //
 // The render loop is still async and event-driven, not a fixed-rate tick —
 // see the Phase 1 comment below for why that invariant matters for Phase 5.
@@ -326,6 +327,8 @@ function draw(screen: Screen): void {
         state.cursor,
         gridScrollRow,
         iconSet,
+        state.marked,
+        state.clipboard,
       );
     } else if (listLayout !== null) {
       store.ensureVisible(frame.listHeight);
@@ -341,6 +344,8 @@ function draw(screen: Screen): void {
         after.scrollTop,
         listLayout,
         iconSet,
+        after.marked,
+        after.clipboard,
       );
     }
   }
@@ -350,6 +355,7 @@ function draw(screen: Screen): void {
     renderStatusBar(screen, 0, frame.statusY, w, {
       itemCount: store.itemCount(),
       markedCount: state.marked.size,
+      clipboard: state.clipboard,
       message: state.message,
     });
   }
@@ -536,11 +542,28 @@ input.onKey((key: Key) => {
     case "quit":
       quit();
       break;
-    case "closeOverlay":
+    case "toggleMark":
+      store.toggleMarkAtCursor();
+      break;
+    case "extendSelection":
+      store.extendSelection(action.dir);
+      break;
+    case "markAll":
+      store.markAll();
+      break;
+    case "copy":
+      store.copy();
+      break;
+    case "cut":
+      store.cut();
+      break;
     case "clearMarks":
+      store.clearMarks();
+      break;
+    case "closeOverlay":
     case "leaveArchive":
-      // Unreachable in Phase 3 — no overlays, marks, or archives exist yet.
-      // See keymap.ts's Escape precedence table.
+      // Unreachable in Phase 4 — no overlays or archives exist yet. See
+      // keymap.ts's Escape precedence table.
       break;
   }
 });

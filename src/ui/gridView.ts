@@ -26,9 +26,29 @@
 // allows.
 
 import type { Entry } from "../fsapi/entry.ts";
-import type { Screen, Style } from "../term/screen.ts";
-import { type IconSet, colorFor, colors, iconFor } from "../term/theme.ts";
+import {
+  ATTR_DIM,
+  ATTR_ITALIC,
+  type Screen,
+  type Style,
+} from "../term/screen.ts";
+import {
+  type IconSet,
+  MARK_GLYPH,
+  colorFor,
+  colors,
+  iconFor,
+  markColor,
+  rowMarkState,
+} from "../term/theme.ts";
 import { pad, truncate } from "../term/width.ts";
+
+/** Structural, not imported from state/store.ts — see ui/listView.ts's file header. */
+type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
+
+// Shared, never mutated — the default for callers that don't care about
+// marks (mirrors ui/listView.ts's EMPTY_MARKED).
+const EMPTY_MARKED: ReadonlySet<string> = new Set();
 
 // ── layout ──
 
@@ -158,6 +178,12 @@ export function clampGridScroll(
 }
 
 // ── rendering ──
+//
+// Phase 4 reuses the marker column's trailing gap (previously always blank)
+// for the same status glyph ui/listView.ts draws — see that file's header
+// for the full reasoning. Cursor (`x`) and mark/clipboard status (`x + 1`)
+// are adjacent columns, so a cell that is both the cursor and marked shows
+// both at once with no special-casing.
 
 function renderCell(
   screen: Screen,
@@ -167,24 +193,40 @@ function renderCell(
   entry: Entry,
   isCursor: boolean,
   iconSet: IconSet,
+  marked: ReadonlySet<string>,
+  clipboard: ClipboardLike,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
   const rowStyle: Style = { bg };
 
+  const markState =
+    entry.name === ".." ? "none" : rowMarkState(entry.path, marked, clipboard);
+  const contentAttr =
+    markState === "cut"
+      ? ATTR_DIM | ATTR_ITALIC
+      : markState === "copied"
+        ? ATTR_DIM
+        : 0;
+
   screen.put(x, y, isCursor ? "›" : " ", {
     ...rowStyle,
     fg: isCursor ? colors.accent : undefined,
   });
+  screen.put(x + 1, y, MARK_GLYPH[markState], {
+    ...rowStyle,
+    fg: markColor(markState),
+  });
   screen.put(x + MARKER_WIDTH, y, pad(iconFor(iconSet, entry), ICON_WIDTH), {
     ...rowStyle,
     fg,
+    attr: contentAttr,
   });
   screen.put(
     x + MARKER_WIDTH + ICON_WIDTH,
     y,
     pad(truncate(entry.name, nameWidth), nameWidth),
-    { ...rowStyle, fg },
+    { ...rowStyle, fg, attr: contentAttr },
   );
 }
 
@@ -204,6 +246,8 @@ export function renderGridView(
   cursor: number,
   scrollRow: number,
   iconSet: IconSet,
+  marked: ReadonlySet<string> = EMPTY_MARKED,
+  clipboard: ClipboardLike = null,
 ): void {
   if (width <= 0 || height <= 0 || entries.length === 0) return;
   const layout = computeGridLayout(
@@ -229,6 +273,8 @@ export function renderGridView(
         entry,
         idx === cursor,
         iconSet,
+        marked,
+        clipboard,
       );
     }
   }

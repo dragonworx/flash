@@ -11,8 +11,14 @@
 // each lives on. It is pure and unit-tested (tests/chrome.test.ts) so a
 // layout regression at some particular (width, height) shows up without a
 // live terminal. Everything else in this file either formats a string
-// (`formatBreadcrumb`, `formatItemCount` — also pure, also tested) or draws
-// with a `Screen` at coordinates a caller already computed.
+// (`formatBreadcrumb`, `formatItemCount`, `formatStatusLeft` — also pure,
+// also tested) or draws with a `Screen` at coordinates a caller already
+// computed.
+//
+// Phase 4 extends the status bar (`formatStatusLeft`/`renderStatusBar`)
+// rather than replacing it: mark count was already a field on `StatusInfo`
+// (`markedCount`), so only the clipboard summary — "N marked · M cut" — is
+// new.
 
 import type { Message } from "../state/store.ts";
 import { ATTR_BOLD, type Screen, type Style } from "../term/screen.ts";
@@ -260,8 +266,28 @@ export function formatItemCount(itemCount: number): string {
 export type StatusInfo = {
   itemCount: number;
   markedCount?: number;
+  /** Structural, not imported from state/store.ts — see ui/listView.ts's file header. */
+  clipboard?: { mode: "copy" | "cut"; paths: string[] } | null;
   message?: Message | null;
 };
+
+/**
+ * The left-hand status text — "N items[, M marked][ · K cut/copied]" — as a
+ * pure string, so a layout/wording regression shows up in a plain unit test
+ * (tests/chrome.test.ts) without a `Screen`. `renderStatusBar` below is a
+ * thin wrapper that paints this plus the transient message.
+ */
+export function formatStatusLeft(info: StatusInfo): string {
+  const marked = info.markedCount ?? 0;
+  const base =
+    marked > 0
+      ? `${formatItemCount(info.itemCount)}, ${marked} marked`
+      : formatItemCount(info.itemCount);
+  const clip = info.clipboard;
+  if (!clip || clip.paths.length === 0) return base;
+  const clipWord = clip.mode === "cut" ? "cut" : "copied";
+  return `${base} · ${clip.paths.length} ${clipWord}`;
+}
 
 /**
  * The status bar as a footer: painted with `colors.footerBg` across the
@@ -277,11 +303,7 @@ export function renderStatusBar(
   info: StatusInfo,
 ): void {
   const style: Style = { bg: colors.footerBg };
-  const marked = info.markedCount ?? 0;
-  const left =
-    marked > 0
-      ? `${formatItemCount(info.itemCount)}, ${marked} marked`
-      : formatItemCount(info.itemCount);
+  const left = formatStatusLeft(info);
   screen.put(x, y, pad(left, width), { ...style, fg: colors.dim });
 
   if (info.message) {

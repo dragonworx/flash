@@ -35,13 +35,39 @@
 // instead of full reverse-video (Phase 2's approach) means a row's
 // file-type color stays visible while it is selected, rather than being
 // swapped away by SGR 7.
+//
+// Phase 4 (selection/clipboard) reuses exactly that reasoning for marks: the
+// column right after the cursor marker — previously always blank, just the
+// marker's trailing gap — now carries `theme.ts`'s `MARK_GLYPH`, a plain
+// character (`*`/`x`/`+`) that is its own color-independent, icon-set-
+// independent cue. Cursor and mark glyphs sit in adjacent columns, so a row
+// that is both the cursor and marked shows both at once with no special
+// casing. Cut/copied rows additionally get `ATTR_DIM`(`|ATTR_ITALIC` for
+// cut) on their icon/name/columns — a bonus for a real terminal, same as
+// `cursorBg`, never the only signal.
 
 import { formatMode, formatMtime, formatSize } from "../fsapi/entry.ts";
 import type { Entry } from "../fsapi/entry.ts";
 import { groupName, userName } from "../fsapi/users.ts";
-import type { Screen, Style } from "../term/screen.ts";
-import { type IconSet, colorFor, colors, iconFor } from "../term/theme.ts";
+import {
+  ATTR_DIM,
+  ATTR_ITALIC,
+  type Screen,
+  type Style,
+} from "../term/screen.ts";
+import {
+  type IconSet,
+  MARK_GLYPH,
+  colorFor,
+  colors,
+  iconFor,
+  markColor,
+  rowMarkState,
+} from "../term/theme.ts";
 import { pad, truncate } from "../term/width.ts";
+
+/** Structural, not imported from state/store.ts — see the file header. */
+type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
 
 // ── column layout ──
 
@@ -79,6 +105,10 @@ const GAP = 1;
 // truncated — and every optional column drops before the name is ever
 // squeezed below it. See `chooseColumns()`.
 const MIN_NAME_WIDTH = 24;
+
+// Shared, never mutated — just the default for callers (existing tests,
+// mostly) that don't care about marks, so they don't need to pass one.
+const EMPTY_MARKED: ReadonlySet<string> = new Set();
 
 function fixedCost(columns: ColumnKey[]): number {
   return (
@@ -195,6 +225,8 @@ function renderRow(
   layout: ListLayout,
   iconSet: IconSet,
   now: number,
+  marked: ReadonlySet<string>,
+  clipboard: ClipboardLike,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -202,17 +234,38 @@ function renderRow(
 
   const { nameX, nameWidth, columns } = layout;
 
+  // The synthetic ".." row is never markable (see Store.toggleMarkAtCursor),
+  // so it never carries a status glyph even if its path happened to collide
+  // with something in `marked` — it can't, but this keeps the intent explicit.
+  const markState =
+    entry.name === ".." ? "none" : rowMarkState(entry.path, marked, clipboard);
+  // Content dims/italicizes to show a pending cut (or, more subtly, a
+  // pending copy); the marker glyphs themselves stay full-strength so
+  // they're always legible regardless of clipboard state.
+  const contentAttr =
+    markState === "cut"
+      ? ATTR_DIM | ATTR_ITALIC
+      : markState === "copied"
+        ? ATTR_DIM
+        : 0;
+
   screen.put(x, y, isCursor ? "›" : " ", {
     ...rowStyle,
     fg: isCursor ? colors.accent : undefined,
   });
+  screen.put(x + 1, y, MARK_GLYPH[markState], {
+    ...rowStyle,
+    fg: markColor(markState),
+  });
   screen.put(x + MARKER_WIDTH, y, pad(iconFor(iconSet, entry), ICON_WIDTH), {
     ...rowStyle,
     fg,
+    attr: contentAttr,
   });
   screen.put(x + nameX, y, pad(truncate(entry.name, nameWidth), nameWidth), {
     ...rowStyle,
     fg,
+    attr: contentAttr,
   });
 
   if (entry.error) {
@@ -223,7 +276,7 @@ function renderRow(
         x + usedWidth + GAP,
         y,
         pad(truncate(entry.error, remaining), remaining),
-        { ...rowStyle, fg: colors.error },
+        { ...rowStyle, fg: colors.error, attr: contentAttr },
       );
     }
     return;
@@ -236,7 +289,7 @@ function renderRow(
       x + colX,
       y,
       pad(columnText(col, entry, now), COLUMN_WIDTH[col], "right"),
-      { ...rowStyle, fg: isCursor ? undefined : colors.dim },
+      { ...rowStyle, fg: isCursor ? undefined : colors.dim, attr: contentAttr },
     );
   }
 }
@@ -260,6 +313,8 @@ export function renderListView(
   scrollTop: number,
   layout: ListLayout,
   iconSet: IconSet,
+  marked: ReadonlySet<string> = EMPTY_MARKED,
+  clipboard: ClipboardLike = null,
   now: number = Date.now(),
 ): void {
   if (width <= 0 || height <= 0) return;
@@ -277,6 +332,8 @@ export function renderListView(
       layout,
       iconSet,
       now,
+      marked,
+      clipboard,
     );
   }
 }

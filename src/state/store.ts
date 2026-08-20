@@ -19,6 +19,14 @@
 // I'm leaving" when there is no recorded history (e.g. flash was launched
 // directly into a deep path via `-d`). That fallback is what makes "go up"
 // land on the directory you came from even on the very first move.
+//
+// Phase 4 (selection and clipboard) changes no file on disk — `marked` and
+// `clipboard` are pure in-memory bookkeeping. `marked` is keyed by absolute
+// path, never by index: indices break the instant Phase 6's watcher
+// re-sorts the list out from under a stale index. The Shift+↑/↓ range
+// anchor is *not* on `AppState` — like `history` above, it is private
+// bookkeeping the renderers never need (see `rangeAnchor`/`rangeLastBounds`
+// below and `extendSelection()`).
 
 import { lstatSync } from "node:fs";
 import { basename, dirname } from "node:path";
@@ -72,6 +80,12 @@ export type StoreInit = {
 
 const MESSAGE_TTL_MS = 4000;
 
+// How far the cursor advances after `Tab` toggles a mark — a named constant
+// per the plan, not inlined, specifically so it stays easy to change.
+// Marking a run of files is `Tab`, `Tab`, `Tab`... this is what makes each
+// tap land on the next untouched entry instead of re-toggling the same one.
+const MARK_ADVANCE = 1;
+
 // ── Store ──
 
 export class Store {
@@ -79,6 +93,14 @@ export class Store {
   private listeners = new Set<() => void>();
   private history = new Map<string, string>(); // dir path -> selected child name
   private messageTimer: ReturnType<typeof setTimeout> | null = null;
+  // Shift+↑/↓ range-select bookkeeping (Phase 4). Not part of `AppState`,
+  // same as `history` above — renderers never need to know about the
+  // anchor, only the `marked` set it writes into. `rangeAnchor` is the
+  // fixed end of the range; `rangeLastBounds` is the [lo, hi] the previous
+  // extendSelection() call actually applied, so the next call can un-mark
+  // whatever fell out of range without touching marks Tab put there.
+  private rangeAnchor: number | null = null;
+  private rangeLastBounds: [number, number] | null = null;
 
   constructor(init: StoreInit) {
     this.state = {
@@ -191,7 +213,21 @@ export class Store {
     this.notify();
   }
 
+  /**
+   * Drop the Shift+↑/↓ range anchor. Called from every cursor-moving method
+   * except `extendSelection` itself, so a stale anchor from a previous
+   * shift-drag never resurfaces after an unrelated move (a plain arrow key,
+   * a directory change, a sort/hidden-file toggle that repositions the
+   * cursor) — the next Shift+↑/↓ always starts a fresh range from wherever
+   * the cursor actually is.
+   */
+  private resetRangeAnchor(): void {
+    this.rangeAnchor = null;
+    this.rangeLastBounds = null;
+  }
+
   private setCursorByName(name: string | undefined): void {
+    this.resetRangeAnchor();
     const list = this.visibleEntries();
     if (list.length === 0) {
       this.state.cursor = 0;
@@ -220,6 +256,7 @@ export class Store {
   moveCursor(delta: number): void {
     const list = this.visibleEntries();
     if (list.length === 0) return;
+    this.resetRangeAnchor();
     const next = this.state.cursor + delta;
     this.state.cursor = Math.max(0, Math.min(list.length - 1, next));
     this.notify();
@@ -228,6 +265,7 @@ export class Store {
   moveCursorTo(pos: "home" | "end"): void {
     const list = this.visibleEntries();
     if (list.length === 0) return;
+    this.resetRangeAnchor();
     this.state.cursor = pos === "home" ? 0 : list.length - 1;
     this.notify();
   }
@@ -240,6 +278,7 @@ export class Store {
   setCursorIndex(index: number): void {
     const list = this.visibleEntries();
     if (list.length === 0) return;
+    this.resetRangeAnchor();
     this.state.cursor = Math.max(
       0,
       Math.min(list.length - 1, Math.trunc(index)),
@@ -328,6 +367,132 @@ export class Store {
     this.state.sort = sort;
     this.setCursorByName(currentName);
     this.notify();
+  }
+
+  // ── selection / marks ──
+
+  /**
+   * Toggle the mark on the entry under the cursor, then advance the cursor
+   * by `MARK_ADVANCE` — the convention that lets a run of files get marked
+   * with repeated taps of `Tab`. The synthetic ".." row is never markable.
+   */
+  toggleMarkAtCursor(): void {
+    const list = this.visibleEntries();
+    const entry = list[this.state.cursor];
+    if (!entry || entry.name === "..") return;
+    if (this.state.marked.has(entry.path)) this.state.marked.delete(entry.path);
+    else this.state.marked.add(entry.path);
+    this.moveCursor(MARK_ADVANCE); // also notifies
+  }
+
+  /**
+   * Extend the mark range from an anchor (fixed to the cursor's position on
+   * the first call after any other cursor movement — see
+   * `resetRangeAnchor`) one step toward `direction`. Recomputes the whole
+   * `[anchor, cursor]` range on every call: newly-included entries get
+   * marked, and whatever fell *out* of the range since the previous call is
+   * un-marked — so reversing direction back past the anchor un-marks the
+   * far side cleanly instead of leaving a trail, while a mark `Tab` placed
+   * outside any extend range is left untouched.
+   */
+  extendSelection(direction: "up" | "down"): void {
+    const list = this.visibleEntries();
+    if (list.length === 0) return;
+    if (this.rangeAnchor === null) this.rangeAnchor = this.state.cursor;
+
+    const delta = direction === "up" ? -1 : 1;
+    const nextCursor = Math.max(
+      0,
+      Math.min(list.length - 1, this.state.cursor + delta),
+    );
+    const lo = Math.min(this.rangeAnchor, nextCursor);
+    const hi = Math.max(this.rangeAnchor, nextCursor);
+
+    if (this.rangeLastBounds) {
+      const [prevLo, prevHi] = this.rangeLastBounds;
+      for (let i = prevLo; i <= prevHi; i++) {
+        if (i < lo || i > hi) {
+          const stale = list[i];
+          if (stale) this.state.marked.delete(stale.path);
+        }
+      }
+    }
+    for (let i = lo; i <= hi; i++) {
+      const e = list[i];
+      if (e && e.name !== "..") this.state.marked.add(e.path);
+    }
+    this.rangeLastBounds = [lo, hi];
+    this.state.cursor = nextCursor;
+    this.notify();
+  }
+
+  /** Mark every real entry in view (never the synthetic ".." row). */
+  markAll(): void {
+    const list = this.visibleEntries();
+    for (const e of list) {
+      if (e.name !== "..") this.state.marked.add(e.path);
+    }
+    this.notify();
+  }
+
+  /** Clear every mark — Escape's second-precedence arm when marks exist. */
+  clearMarks(): void {
+    if (this.state.marked.size === 0) return;
+    this.state.marked.clear();
+    this.resetRangeAnchor();
+    this.notify();
+  }
+
+  /**
+   * Drop marks for paths no longer present. Marks are keyed by absolute
+   * path specifically so this is possible without guessing at index
+   * correspondence — Phase 6's watcher calls this after every rescan.
+   */
+  pruneMarks(existingPaths: Iterable<string>): void {
+    const keep = new Set(existingPaths);
+    let changed = false;
+    for (const p of this.state.marked) {
+      if (!keep.has(p)) {
+        this.state.marked.delete(p);
+        changed = true;
+      }
+    }
+    if (changed) this.notify();
+  }
+
+  // ── clipboard ──
+
+  /**
+   * Stage the marked set — or, when nothing is marked, the entry under the
+   * cursor, the fallback that makes a single-file copy/cut fast — into the
+   * clipboard register. Nothing here touches disk: per the plan, a cut is
+   * non-destructive until Phase 5a's paste actually runs.
+   */
+  copy(): void {
+    this.stageClipboard("copy");
+  }
+
+  cut(): void {
+    this.stageClipboard("cut");
+  }
+
+  private stageClipboard(mode: "copy" | "cut"): void {
+    const paths = this.clipboardCandidatePaths();
+    if (paths.length === 0) {
+      this.setMessage(`nothing to ${mode}`);
+      return;
+    }
+    this.state.clipboard = { mode, paths };
+    const label = paths.length === 1 ? "1 item" : `${paths.length} items`;
+    this.setMessage(`${label} ${mode === "cut" ? "cut" : "copied"}`);
+  }
+
+  private clipboardCandidatePaths(): string[] {
+    if (this.state.marked.size > 0) return [...this.state.marked];
+    const list = this.visibleEntries();
+    const entry = list[this.state.cursor];
+    if (!entry || entry.name === "..") return [];
+    return [entry.path];
   }
 
   // ── messages ──
