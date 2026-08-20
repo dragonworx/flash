@@ -63,10 +63,14 @@ bun run build:binary         # dist/flash — see build.ts
 ./dist/flash
 ```
 
-Expect roughly 95 MB on linux-x64 (and about 63 MB on darwin-arm64) — that's an embedded
-Bun runtime, not a bug. `--minify --bytecode` is the only meaningful size lever, and
-`build.ts` documents why cross-compiling (`--target=bun-linux-x64` /
-`--target=bun-darwin-arm64`) needs network access the first time it runs.
+Expect roughly 95 MB on linux-x64 and 63 MB on darwin-arm64 (measured: 91 MiB / 61 MiB) —
+that's an embedded Bun runtime, not a bug, and the app's own code barely moves it.
+`bun run build:binary -- --minify` is the only lever worth pulling (`build.ts` deliberately
+does *not* add `--bytecode`: verified on this machine, it fails to compile this codebase at
+all, since `--bytecode` doesn't support the top-level `await` in `src/main.ts`).
+`build.ts` documents why cross-compiling (`--target=bun-linux-x64` / `--target=bun-darwin-arm64`,
+also wired up as `bun run build:binary:linux-x64` / `:darwin-arm64`) needs network access
+the first time it runs — both were verified working from this machine.
 
 ## Usage
 

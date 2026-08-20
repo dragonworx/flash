@@ -91,7 +91,11 @@ const USAGE = `flash [-d|--dir <path>] [--view list|grid] [--icons unicode|nerd|
 function parseFlags() {
   try {
     const { values } = parseArgs({
-      args: Bun.argv.slice(2),
+      // `process.argv`, not `Bun.argv` — identical under Bun, but `Bun` is
+      // not a global under the npm/Node distribution path `dist/flash.js`
+      // targets (see build.ts), and this line runs before anything has had
+      // a chance to fall back.
+      args: process.argv.slice(2),
       options: {
         dir: { type: "string", short: "d" },
         view: { type: "string" },
