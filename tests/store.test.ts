@@ -397,21 +397,38 @@ describe("Store.paste", () => {
     }
   });
 
-  it("shows a 'not yet implemented' message for a cut clipboard and touches no disk", async () => {
+  it("moves a cut clipboard into the current directory, clearing the clipboard and marks on the moved source (Phase 5b)", async () => {
+    // A dedicated source dir, not `selRoot` — this test deletes the source
+    // for real (that's the whole point of cut/move), and `selRoot` is
+    // shared read-mostly fixture data other tests in this file still rely
+    // on by name.
+    const src = mkdtempSync(join(tmpdir(), "flash-store-cut-src-"));
     const dest = mkdtempSync(join(tmpdir(), "flash-store-paste-dest-"));
     try {
-      const store = await makeSelStore();
-      store.setCursorIndex(indexOf(store, "f2.txt"));
+      writeFileSync(join(src, "cutme.txt"), "cut me");
+      const store = new Store({ cwd: src });
+      await store.load(src);
+      const idx = indexOf(store, "cutme.txt");
+      store.setCursorIndex(idx);
+      const srcPath = store.visibleEntries()[idx]?.path ?? "";
+      store.toggleMarkAtCursor(); // marked, so we can prove the mark is cleared too
       store.cut();
+      expect(store.getState().clipboard).toEqual({
+        mode: "cut",
+        paths: [srcPath],
+      });
+
       await store.load(dest);
       await store.paste();
 
-      expect(readdirSync(dest)).toEqual([]);
-      // The clipboard stays staged — nothing dangerous happened, so there's
-      // nothing to discard.
-      expect(store.getState().clipboard?.mode).toBe("cut");
-      expect(store.getState().message?.text).toContain("not yet implemented");
+      expect(existsSync(join(dest, "cutme.txt"))).toBe(true);
+      expect(existsSync(srcPath)).toBe(false);
+      expect(store.getState().clipboard).toBeNull();
+      expect(store.getState().marked.has(srcPath)).toBe(false);
+      expect(store.getState().overlay).toBeNull();
+      expect(store.getState().message?.text).toContain("moved 1 item");
     } finally {
+      rmSync(src, { recursive: true, force: true });
       rmSync(dest, { recursive: true, force: true });
     }
   });

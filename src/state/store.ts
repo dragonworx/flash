@@ -42,13 +42,27 @@
 // the job is ever queued, and the count of how many were skipped is folded
 // into the summary message — the plan leaves this open and recommends
 // exactly this over failing the whole paste.
+//
+// Phase 5b (cut/move) reuses every bit of that machinery: `paste()` now
+// branches on `clipboard.mode` and, for a cut, calls `runCut()` instead of
+// `runCopy()`. Both go through the same `pasteAbort`/progress-overlay
+// bookkeeping, so Esc cancels a cut exactly like it cancels a copy. The one
+// real difference: a successful cut clears not just the clipboard but also
+// any marks pointing at the sources that actually moved — a cut source no
+// longer exists, so a mark left on it would point at nothing (the same
+// failure mode Phase 6's `pruneMarks` exists to fix after a rescan, applied
+// here eagerly because `runCutJob`'s outcome already tells us exactly which
+// paths disappeared). Marks on sources that did NOT move — skipped by the
+// guard, or copied-but-failed-to-delete on the EXDEV fallback, see
+// ops/move.ts — are deliberately left alone, because those sources still
+// exist.
 
 import { lstatSync } from "node:fs";
 import { lstat } from "node:fs/promises";
 import { basename, dirname } from "node:path";
 import type { Entry } from "../fsapi/entry.ts";
-import type { PasteOutcome } from "../fsapi/ops/queue.ts";
-import { runPasteJob } from "../fsapi/ops/queue.ts";
+import type { CutOutcome, PasteOutcome } from "../fsapi/ops/queue.ts";
+import { runCutJob, runPasteJob } from "../fsapi/ops/queue.ts";
 import {
   DEFAULT_SORT,
   SORT_KEYS,
@@ -531,18 +545,14 @@ export class Store {
     return [entry.path];
   }
 
-  // ── paste (Phase 5a) ──
+  // ── paste (Phase 5a copy, Phase 5b cut) ──
 
   /**
-   * Consume `state.clipboard` and copy its paths into the current
-   * directory. Only `mode: "copy"` executes this phase — a `mode: "cut"`
-   * clipboard shows a "not yet implemented" message and touches nothing on
-   * disk, per the plan (Phase 5b implements move/cut-execution). Vanished
-   * clipboard paths are filtered out before queueing and reported by count
-   * rather than failing the whole paste (see the file header). Clears the
-   * clipboard only once at least one source actually landed and the job
-   * was not cancelled — a fully-rejected or fully-cancelled paste leaves
-   * the clipboard staged so the user can fix whatever was wrong and retry.
+   * Consume `state.clipboard` against the current directory: copies it for
+   * `mode: "copy"`, moves it for `mode: "cut"`. Both branches share the
+   * abort/progress-overlay bookkeeping below; only what happens to the
+   * sources afterward (and the job each queues into) differs — see
+   * `runCopy`/`runCut`.
    */
   async paste(): Promise<void> {
     const clipboard = this.state.clipboard;
@@ -550,17 +560,28 @@ export class Store {
       this.setMessage("clipboard is empty");
       return;
     }
-    if (clipboard.mode === "cut") {
-      this.setMessage("cut/move not yet implemented");
-      return;
-    }
     if (this.state.overlay?.kind === "progress") {
-      this.setMessage("a copy is already in progress");
+      this.setMessage("an operation is already in progress");
       return;
     }
+    if (clipboard.mode === "cut") {
+      await this.runCut(clipboard.paths);
+    } else {
+      await this.runCopy(clipboard.paths);
+    }
+  }
 
+  /**
+   * `mode: "copy"` side of `paste()`. Vanished clipboard paths are filtered
+   * out before queueing and reported by count rather than failing the
+   * whole paste (see the file header). Clears the clipboard only once at
+   * least one source actually landed and the job was not cancelled — a
+   * fully-rejected or fully-cancelled paste leaves the clipboard staged so
+   * the user can fix whatever was wrong and retry.
+   */
+  private async runCopy(paths: string[]): Promise<void> {
     const destDir = this.state.cwd;
-    const { present, missing } = await partitionExisting(clipboard.paths);
+    const { present, missing } = await partitionExisting(paths);
     if (present.length === 0) {
       this.state.clipboard = null;
       this.setMessage(
@@ -613,6 +634,75 @@ export class Store {
     await this.load(this.state.cwd);
   }
 
+  /**
+   * `mode: "cut"` side of `paste()` — Phase 5b. Structurally identical to
+   * `runCopy` above (same abort controller field, same progress-overlay
+   * shape, same vanished-path handling), but queues through
+   * `ops/queue.ts`'s `runCutJob` (guard -> conflict resolution -> `moveAll`,
+   * see queue.ts and move.ts) instead of `runPasteJob`, and only clears
+   * marks/clipboard for sources `runCutJob` actually reports as moved — see
+   * the file header. A same-device cut resolves via a single `rename` call
+   * per source and never yields to the event loop, so the progress overlay
+   * set up below never actually gets painted for it (the overlay is
+   * cleared again before the scheduled repaint runs); a cross-device cut is
+   * a real copy underneath and yields exactly like `runCopy`, so the
+   * overlay shows for that case for free. No branching on distance is
+   * needed here — it falls out of how the two paths yield.
+   */
+  private async runCut(paths: string[]): Promise<void> {
+    const destDir = this.state.cwd;
+    const { present, missing } = await partitionExisting(paths);
+    if (present.length === 0) {
+      this.state.clipboard = null;
+      this.setMessage(
+        missing.length > 0
+          ? `nothing to paste — ${missing.length} item${missing.length === 1 ? "" : "s"} no longer exist`
+          : "nothing to paste",
+        "error",
+      );
+      return;
+    }
+
+    const abort = new AbortController();
+    this.pasteAbort = abort;
+    this.state.overlay = {
+      kind: "progress",
+      label: "Moving",
+      done: 0,
+      total: 0,
+      currentPath: "",
+      bytesDone: 0,
+      bytesTotal: 0,
+    };
+    this.notify();
+
+    let outcome: CutOutcome;
+    try {
+      outcome = await runCutJob({
+        destDir,
+        sources: present,
+        signal: abort.signal,
+        onProgress: (p) => {
+          if (this.pasteAbort !== abort) return;
+          this.state.overlay = { kind: "progress", label: "Moving", ...p };
+          this.notify();
+        },
+      });
+    } finally {
+      if (this.pasteAbort === abort) this.pasteAbort = null;
+    }
+
+    this.state.overlay = null;
+    if (outcome.movedSources.length > 0 && !outcome.cancelled) {
+      // The sources are gone — see the file header on why only the ones
+      // that actually moved get their marks dropped.
+      this.state.clipboard = null;
+      for (const src of outcome.movedSources) this.state.marked.delete(src);
+    }
+    this.reportCutOutcome(outcome, missing.length);
+    await this.load(this.state.cwd);
+  }
+
   /** Esc while the progress overlay is open (see keymap.ts's Escape precedence). */
   cancelPaste(): void {
     this.pasteAbort?.abort();
@@ -646,6 +736,35 @@ export class Store {
         : "info";
     this.setMessage(
       parts.length > 0 ? parts.join(", ") : "nothing copied",
+      kind,
+    );
+  }
+
+  private reportCutOutcome(outcome: CutOutcome, vanishedCount: number): void {
+    const parts: string[] = [];
+    if (outcome.cancelled) {
+      parts.push("move cancelled");
+    } else if (outcome.movedSources.length > 0) {
+      const n = outcome.movedSources.length;
+      parts.push(`moved ${n} item${n === 1 ? "" : "s"}`);
+    }
+    if (outcome.skipped.length > 0) {
+      parts.push(`${outcome.skipped.length} rejected`);
+    }
+    if (outcome.errors.length > 0) {
+      parts.push(
+        `${outcome.errors.length} error${outcome.errors.length === 1 ? "" : "s"}`,
+      );
+    }
+    if (vanishedCount > 0) {
+      parts.push(`${vanishedCount} vanished`);
+    }
+    const kind: Message["kind"] =
+      outcome.errors.length > 0 || outcome.skipped.length > 0
+        ? "error"
+        : "info";
+    this.setMessage(
+      parts.length > 0 ? parts.join(", ") : "nothing moved",
       kind,
     );
   }

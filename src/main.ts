@@ -573,10 +573,12 @@ input.onKey((key: Key) => {
       store.clearMarks();
       break;
     case "closeOverlay":
-      // The paste progress overlay (Phase 5a) is the only real overlay so
-      // far — closing it means cancelling the in-flight copy, not a bare
-      // dismiss. Phase 7's help/prompt/permissions overlays will need a
-      // plain "just close" arm here too, once they exist.
+      // The paste/cut progress overlay (Phase 5a/5b) is the only real
+      // overlay so far — closing it means cancelling the in-flight copy or
+      // move, not a bare dismiss. `cancelPaste()` covers both: it just
+      // aborts whichever `AbortController` `state/store.ts` has staged.
+      // Phase 7's help/prompt/permissions overlays will need a plain "just
+      // close" arm here too, once they exist.
       if (store.getState().overlay?.kind === "progress") store.cancelPaste();
       break;
     case "leaveArchive":
