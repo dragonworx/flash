@@ -19,7 +19,18 @@
 // rather than replacing it: mark count was already a field on `StatusInfo`
 // (`markedCount`), so only the clipboard summary — "N marked · M cut" — is
 // new.
+//
+// Phase 8 (archives) extends the breadcrumb the same way: `formatBreadcrumb`/
+// `renderBreadcrumb`/`renderBanner` all grow an optional trailing `archive`
+// parameter. `cwd` never changes while browsing inside a zip (see
+// state/store.ts's file header) — only `state.archive.innerPath` does — so
+// the archive's own segments (its basename, then each inner path component)
+// are appended on top of the ordinary cwd segments rather than replacing
+// them, and the whole thing still collapses as one path. `ArchiveBreadcrumb`
+// is structural, not imported from state/store.ts, same reasoning as
+// `ClipboardLike` below and in ui/listView.ts.
 
+import { basename } from "node:path";
 import type { Message } from "../state/store.ts";
 import { ATTR_BOLD, type Screen, type Style } from "../term/screen.ts";
 import { colors } from "../term/theme.ts";
@@ -30,63 +41,105 @@ import { pad, stringWidth, truncate } from "../term/width.ts";
 const CHEVRON = " › ";
 const COLLAPSE = "…";
 
+export type ArchiveBreadcrumb = { zipPath: string; innerPath: string };
+
 /** Split an absolute path into breadcrumb segments: `/a/b` -> `["/", "a", "b"]`. */
 export function pathSegments(cwd: string): string[] {
   const parts = cwd.split("/").filter((p) => p.length > 0);
   return ["/", ...parts];
 }
 
+type Segment = { text: string; isArchive: boolean };
+
+/** `pathSegments(cwd)` plus, when browsing an archive, its own segments —
+ * the zip's basename followed by each `innerPath` component — tagged so
+ * `renderBreadcrumb` can style them distinctly from the real filesystem
+ * path they're appended to. */
+function toSegments(
+  cwd: string,
+  archive?: ArchiveBreadcrumb | null,
+): Segment[] {
+  const real = pathSegments(cwd).map((text) => ({ text, isArchive: false }));
+  if (!archive) return real;
+  const inner = archive.innerPath
+    ? archive.innerPath.split("/").filter((p) => p.length > 0)
+    : [];
+  const archiveParts = [basename(archive.zipPath), ...inner];
+  return [...real, ...archiveParts.map((text) => ({ text, isArchive: true }))];
+}
+
 /**
  * The segments actually shown, post-collapse, in display order — shared by
  * `formatBreadcrumb` (joins them with a plain chevron, for plain-text
  * rendering and tests) and `renderBreadcrumb` (styles each one separately so
- * the current directory's own name can be emphasised over its ancestors).
- * When the full path fits, this is just `pathSegments(cwd)`. Otherwise the
- * first segment is kept, the middle collapses to a single `"…"` entry, and
- * as many trailing segments as fit are kept — so the segment the user is
- * actually inside is always the last thing to be cut.
+ * the current directory's own name — and, inside an archive, the archive
+ * segments — can be emphasised over the rest). When the full path fits,
+ * this is just `toSegments(cwd, archive)`. Otherwise the first segment is
+ * kept, the middle collapses to a single `"…"` entry, and as many trailing
+ * segments as fit are kept — so the segment the user is actually inside is
+ * always the last thing to be cut.
  */
-function collapseParts(cwd: string, maxWidth: number): string[] {
+function collapseSegments(segments: Segment[], maxWidth: number): Segment[] {
   if (maxWidth <= 0) return [];
-  const segments = pathSegments(cwd);
-  const full = segments.join(CHEVRON);
+  const full = segments.map((s) => s.text).join(CHEVRON);
   if (stringWidth(full) <= maxWidth) return segments;
 
-  const first = segments[0] ?? "/";
-  let tail: string[] = [];
+  const first = segments[0] ?? { text: "/", isArchive: false };
+  let tail: Segment[] = [];
   for (let i = segments.length - 1; i >= 1; i--) {
     const seg = segments[i];
     if (seg === undefined) continue;
     const candidateTail = [seg, ...tail];
-    const candidate = [first, COLLAPSE, ...candidateTail].join(CHEVRON);
+    const candidate = [
+      first,
+      { text: COLLAPSE, isArchive: false },
+      ...candidateTail,
+    ]
+      .map((s) => s.text)
+      .join(CHEVRON);
     if (stringWidth(candidate) > maxWidth) break;
     tail = candidateTail;
   }
   if (tail.length === 0) {
     // Not even `first › … › lastSegment` fits — fall back to a bare
     // truncation of just the last segment so something legible shows.
-    const last = segments[segments.length - 1] ?? "";
-    return [truncate(last, maxWidth)];
+    const last = segments[segments.length - 1];
+    return [
+      {
+        text: truncate(last?.text ?? "", maxWidth),
+        isArchive: last?.isArchive ?? false,
+      },
+    ];
   }
-  return [first, COLLAPSE, ...tail];
+  return [first, { text: COLLAPSE, isArchive: false }, ...tail];
 }
 
 /**
- * Render `cwd` as a breadcrumb string that fits in `maxWidth` columns —
- * plain text, no styling, used by `--dump-frame`'s plain-text path and by
- * tests. See `collapseParts` for the collapsing rule.
+ * Render `cwd` (and, when given, the archive currently being browsed inside
+ * it) as a breadcrumb string that fits in `maxWidth` columns — plain text,
+ * no styling, used by `--dump-frame`'s plain-text path and by tests. See
+ * `collapseSegments` for the collapsing rule.
  */
-export function formatBreadcrumb(cwd: string, maxWidth: number): string {
-  return collapseParts(cwd, maxWidth).join(CHEVRON);
+export function formatBreadcrumb(
+  cwd: string,
+  maxWidth: number,
+  archive?: ArchiveBreadcrumb | null,
+): string {
+  return collapseSegments(toSegments(cwd, archive), maxWidth)
+    .map((s) => s.text)
+    .join(CHEVRON);
 }
 
 /**
  * Draw the breadcrumb into the banner: ancestor segments dim, chevrons
- * dimmer still (chrome, not content), and the current directory's own name
- * — always the last part, whether or not the path was collapsed — bold and
- * bright. This is the "emphasise the current directory" half of the visual
- * design pass; `formatBreadcrumb` above stays byte-for-byte the plain-text
- * equivalent for snapshots.
+ * dimmer still (chrome, not content), the current directory's own name —
+ * always the last real-filesystem part — bold and bright, and, when
+ * browsing inside an archive, its segments in `colors.archive` (the same
+ * color the file-type coloring already uses for `.zip` files elsewhere, so
+ * "you're inside an archive" reads as the same visual language) with the
+ * innermost one bold. This is the "emphasise where you are" half of the
+ * visual design pass; `formatBreadcrumb` above stays byte-for-byte the
+ * plain-text equivalent for snapshots.
  */
 export function renderBreadcrumb(
   screen: Screen,
@@ -94,8 +147,9 @@ export function renderBreadcrumb(
   y: number,
   width: number,
   cwd: string,
+  archive?: ArchiveBreadcrumb | null,
 ): void {
-  const parts = collapseParts(cwd, width);
+  const parts = collapseSegments(toSegments(cwd, archive), width);
   if (parts.length === 0) return;
   const lastIdx = parts.length - 1;
 
@@ -106,15 +160,17 @@ export function renderBreadcrumb(
     if (part === undefined || remaining <= 0) break;
 
     const isLast = i === lastIdx;
-    const isCollapse = part === COLLAPSE;
+    const isCollapse = part.text === COLLAPSE;
     const style: Style = isCollapse
       ? { fg: colors.chrome }
-      : isLast
-        ? { fg: colors.titleEmphasis, attr: ATTR_BOLD }
-        : { fg: colors.dim };
+      : part.isArchive
+        ? { fg: colors.archive, attr: isLast ? ATTR_BOLD : 0 }
+        : isLast
+          ? { fg: colors.titleEmphasis, attr: ATTR_BOLD }
+          : { fg: colors.dim };
 
-    const w = Math.min(stringWidth(part), remaining);
-    screen.put(cx, y, part, style);
+    const w = Math.min(stringWidth(part.text), remaining);
+    screen.put(cx, y, part.text, style);
     cx += w;
     remaining -= w;
 
@@ -247,13 +303,21 @@ export function renderBanner(
   width: number,
   frame: Frame,
   cwd: string,
+  archive?: ArchiveBreadcrumb | null,
 ): void {
   if (frame.border && frame.bannerTopY !== null) {
     screen.box(0, frame.bannerTopY, width, 3, { fg: colors.chrome });
-    renderBreadcrumb(screen, 2, frame.breadcrumbY, Math.max(width - 4, 0), cwd);
+    renderBreadcrumb(
+      screen,
+      2,
+      frame.breadcrumbY,
+      Math.max(width - 4, 0),
+      cwd,
+      archive,
+    );
     return;
   }
-  renderBreadcrumb(screen, 0, frame.breadcrumbY, width, cwd);
+  renderBreadcrumb(screen, 0, frame.breadcrumbY, width, cwd, archive);
   if (frame.bannerRuleY !== null) renderRule(screen, frame.bannerRuleY, width);
 }
 
