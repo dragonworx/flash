@@ -54,7 +54,11 @@ import {
   moveGridCursor,
   renderGridView,
 } from "./ui/gridView.ts";
-import { renderListHeader, renderListView } from "./ui/listView.ts";
+import {
+  computeListLayout,
+  renderListHeader,
+  renderListView,
+} from "./ui/listView.ts";
 
 // ── flag parsing ──
 
@@ -277,8 +281,13 @@ function draw(screen: Screen): void {
 
   renderBanner(screen, w, frame, state.cwd);
   const listEntries = state.view === "list" ? store.visibleEntries() : [];
-  if (frame.headerY !== null && state.view === "list") {
-    renderListHeader(screen, 0, frame.headerY, w, listEntries);
+  // Computed once and threaded through both the header and the row
+  // rendering below — never recomputed separately — so the two can never
+  // disagree about where a column starts (see ui/listView.ts's file
+  // header).
+  const listLayout = state.view === "list" ? computeListLayout(w) : null;
+  if (frame.headerY !== null && listLayout !== null) {
+    renderListHeader(screen, 0, frame.headerY, listLayout);
   }
   if (frame.headerRuleY !== null) renderRule(screen, frame.headerRuleY, w);
 
@@ -318,7 +327,7 @@ function draw(screen: Screen): void {
         gridScrollRow,
         iconSet,
       );
-    } else {
+    } else if (listLayout !== null) {
       store.ensureVisible(frame.listHeight);
       const after = store.getState();
       renderListView(
@@ -330,6 +339,7 @@ function draw(screen: Screen): void {
         listEntries,
         after.cursor,
         after.scrollTop,
+        listLayout,
         iconSet,
       );
     }
