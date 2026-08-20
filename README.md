@@ -63,6 +63,28 @@ bun run build:binary         # dist/flash — see build.ts
 ./dist/flash
 ```
 
+**Install it system-wide** — `bun mount` builds the binary and drops it on your PATH
+in one step:
+
+```sh
+bun mount                    # -> ~/.local/bin/flash
+flash                        # now works from anywhere
+bun unmount                  # removes it again
+```
+
+It installs to `~/.local/bin` by default, creating that directory if needed. Override
+with `FLASH_BIN_DIR`:
+
+```sh
+FLASH_BIN_DIR=/usr/local/bin sudo -E bun mount   # all users on the machine
+```
+
+Note that this installs a *copy*, so `git pull` will not update the mounted command —
+re-run `bun mount` after pulling. If you would rather the command track your working
+tree, use `bun run build && npm link` instead, which installs a shim pointing at
+`dist/flash.js`; that one needs Node at runtime and is tied to whichever Node version
+was active when you linked it.
+
 Expect roughly 95 MB on linux-x64 and 63 MB on darwin-arm64 (measured: 91 MiB / 61 MiB) —
 that's an embedded Bun runtime, not a bug, and the app's own code barely moves it.
 `bun run build:binary -- --minify` is the only lever worth pulling (`build.ts` deliberately

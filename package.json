@@ -15,6 +15,8 @@
     "build:binary:linux-x64": "bun build.ts --binary --target bun-linux-x64",
     "build:binary:darwin-arm64": "bun build.ts --binary --target bun-darwin-arm64",
     "build:all": "bun build.ts --all",
+    "mount": "bun build.ts --binary && mkdir -p \"${FLASH_BIN_DIR:-$HOME/.local/bin}\" && install -m755 dist/flash \"${FLASH_BIN_DIR:-$HOME/.local/bin}/flash\" && printf 'mounted -> %s/flash\\n' \"${FLASH_BIN_DIR:-$HOME/.local/bin}\"",
+    "unmount": "rm -f \"${FLASH_BIN_DIR:-$HOME/.local/bin}/flash\" && printf 'unmounted from %s\\n' \"${FLASH_BIN_DIR:-$HOME/.local/bin}\"",
     "test": "bun test",
     "typecheck": "tsc --noEmit",
     "lint": "bunx biome check src/ tests/",
