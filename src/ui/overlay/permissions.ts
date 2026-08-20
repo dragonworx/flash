@@ -51,7 +51,7 @@ export function bitAt(rwxBits: number, i: number): boolean {
 }
 
 const BOX_WIDTH_MIN = 34;
-const BOX_WIDTH_MAX = 56;
+const BOX_WIDTH_MAX = 60; // wide enough that the footer hint never truncates at 80 columns
 const BOX_HEIGHT = 12; // border, title, blank, header, 3 grid rows, special row, octal row, blank, footer, border
 
 export type PermissionsBoxRect = {
