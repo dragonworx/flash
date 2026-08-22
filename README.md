@@ -139,6 +139,7 @@ and `Backspace` always go up, regardless of state.
 | `h` `Backspace` | Go up a directory, always |
 | `PgUp` `PgDn` | Page up / down |
 | `Home` `End` | Jump to first / last entry |
+| `b` | Open goto bookmarks and jump to one |
 | **Selection** | |
 | `Tab` | Toggle the mark on the entry under the cursor |
 | `Shift+↑` `Shift+↓` | Extend the marked range from the cursor |
@@ -170,6 +171,24 @@ either way it's a real subprocess, so binary-file detection, themes, and highlig
 come from `bat` itself rather than being reimplemented in `flash`. Directories, archives,
 and device/socket/fifo entries never go through preview; `Enter` on those opens or enters
 them as usual.
+
+### Goto bookmarks
+
+`flash` reads (never writes) the bookmark list kept by
+[`goto`](https://github.com/dragonworx/goto), a separate directory-jump shell tool. If
+`goto` is set up on your machine, `b` opens a scrollable picker listing every bookmark in
+the same most-recently-used order `goto`'s own interactive picker uses; `Enter`/`Space`
+jumps the file view straight to the selected path, and `Esc` or `b` again closes it without
+navigating. Any directory currently open that happens to be one of those bookmarks gets a
+`★` after its name — in the breadcrumb, and on its row in the list/grid view when it appears
+as a child entry.
+
+Bookmarks are re-read from disk on every navigation and whenever `b` opens the picker, so a
+bookmark added, renamed, or removed with `goto -a`/`-r`/`-d` in another terminal shows up
+without restarting `flash`. It looks for goto's config at `$GOTO_HOME` (however goto's own
+shell wrapper set it for your session), falling back to `~/.goto` — the same default goto
+itself uses. Nothing changes here if you don't use `goto`: a missing or empty bookmark file
+just means `b` reports "no goto bookmarks found" and the `★` never shows.
 
 ## Config file
 
