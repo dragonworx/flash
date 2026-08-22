@@ -1,4 +1,4 @@
-# flash
+# Flash
 
 **Terminal file management, reimagined for speed.**
 
@@ -6,12 +6,13 @@ Most file managers make you wait — for a mouse to move, for a window to
 redraw, for a spinner to finish. `flash` doesn't. It's a full-screen,
 keyboard-driven terminal file manager built to react the instant you press a
 key: navigate, multi-select, copy/cut/paste with conflict resolution and a
-live progress bar, rename, mkdir, delete, edit permissions, and browse zip
-archives as if they were folders — all rendered as a list or a grid with
-icons, sizes, permissions, owner/group, and modified time, and all kept live
-as files change underneath it. No mouse support, on purpose: your terminal's
-own click-drag text selection keeps working inside a `flash` pane. Point it
-at a directory and move at the speed of thought.
+live progress bar, rename, mkdir, delete, edit permissions, preview text
+files in place, and browse zip archives as if they were folders — all
+rendered as a list or a grid with icons, sizes, permissions, owner/group,
+and modified time, and all kept live as files change underneath it. No
+mouse support, on purpose: your terminal's own click-drag text selection
+keeps working inside a `flash` pane. Point it at a directory and move at
+the speed of thought.
 
 Below is a quick tour — install it in under a minute, then skim the
 keybindings so nothing surprises you once you're in.
@@ -134,7 +135,7 @@ and `Backspace` always go up, regardless of state.
 | `↑` `↓` | Move (list) · move a row (grid) |
 | `←` `→` | Go up / open (list) · move left/right (grid) |
 | `k` `j` | Move cursor up / down |
-| `Enter` `Space` `l` | Open the selected entry |
+| `Enter` `Space` `l` | Open the selected entry — enter a directory, or open text file preview |
 | `h` `Backspace` | Go up a directory, always |
 | `PgUp` `PgDn` | Page up / down |
 | `Home` `End` | Jump to first / last entry |
@@ -159,6 +160,16 @@ and `Backspace` always go up, regardless of state.
 | **App** | |
 | `?` | Show the help overlay (scrollable; `?` again or `Esc` closes it) |
 | `q` `Ctrl+C` | Quit |
+
+### File preview
+
+`Enter`/`Space`/`l` on a regular text file opens a near-full-screen preview, scrollable
+in place without leaving `flash`. It pipes the file through [`bat`](https://github.com/sharkdp/bat)
+for syntax highlighting when `bat` is on `PATH`, falling back to plain `cat` otherwise —
+either way it's a real subprocess, so binary-file detection, themes, and highlighting all
+come from `bat` itself rather than being reimplemented in `flash`. Directories, archives,
+and device/socket/fifo entries never go through preview; `Enter` on those opens or enters
+them as usual.
 
 ## Config file
 
