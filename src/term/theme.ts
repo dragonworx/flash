@@ -272,3 +272,14 @@ export function markColor(state: RowMarkState): number | undefined {
       return undefined;
   }
 }
+
+// ── goto bookmarks ──
+//
+// The suffix appended to a directory's displayed name when its path is a
+// goto bookmark (fsapi/goto.ts) — the breadcrumb (ui/chrome.ts) and both
+// list/grid rows (ui/listView.ts/ui/gridView.ts) all share this one glyph
+// and color, same "plain Unicode chrome, not gated by --icons" precedent as
+// the breadcrumb's `›`/`…` (see ui/overlay/help.ts's file header).
+
+export const BOOKMARK_GLYPH = " ★";
+export const bookmarkColor = colors.accent;

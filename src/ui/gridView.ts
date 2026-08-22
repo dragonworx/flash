@@ -33,6 +33,7 @@ import {
   type Style,
 } from "../term/screen.ts";
 import {
+  BOOKMARK_GLYPH,
   type IconSet,
   MARK_GLYPH,
   colorFor,
@@ -41,7 +42,7 @@ import {
   markColor,
   rowMarkState,
 } from "../term/theme.ts";
-import { pad, truncate } from "../term/width.ts";
+import { pad, stringWidth, truncate } from "../term/width.ts";
 
 /** Structural, not imported from state/store.ts — see ui/listView.ts's file header. */
 type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
@@ -49,6 +50,8 @@ type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
 // Shared, never mutated — the default for callers that don't care about
 // marks (mirrors ui/listView.ts's EMPTY_MARKED).
 const EMPTY_MARKED: ReadonlySet<string> = new Set();
+// Same reasoning, for callers that don't care about goto bookmarks.
+const EMPTY_BOOKMARKS: ReadonlySet<string> = new Set();
 
 // ── layout ──
 
@@ -69,12 +72,27 @@ export type GridLayout = {
 };
 
 /**
- * `nameWidths` is each visible entry's cached display width
- * (`Entry.width` — see term/width.ts's "never measure width per row per
- * frame" invariant), not the entries themselves, so this stays a pure
- * function over numbers and is trivial to unit test with synthetic widths
- * (including a wide CJK/emoji case) without constructing fake `Entry`
- * objects.
+ * `entry.width` (see term/width.ts's "never measure width per row per
+ * frame" invariant) plus the goto-bookmark star's width when this entry
+ * gets one (see renderCell's own ".." exclusion) — callers must feed this,
+ * not the bare `entry.width`, into `computeGridLayout`'s `nameWidths`, or a
+ * bookmarked name sitting right at the column's width cap gets its star
+ * silently truncated off by `truncate()` instead of the column reserving
+ * room for it up front.
+ */
+export function entryDisplayWidth(
+  entry: Entry,
+  bookmarks: ReadonlySet<string>,
+): number {
+  if (entry.name === ".." || !bookmarks.has(entry.path)) return entry.width;
+  return entry.width + stringWidth(BOOKMARK_GLYPH);
+}
+
+/**
+ * `nameWidths` is each visible entry's display width (`entryDisplayWidth`
+ * above), not the entries themselves, so this stays a pure function over
+ * numbers and is trivial to unit test with synthetic widths (including a
+ * wide CJK/emoji case) without constructing fake `Entry` objects.
  */
 export function computeGridLayout(
   width: number,
@@ -195,6 +213,7 @@ function renderCell(
   iconSet: IconSet,
   marked: ReadonlySet<string>,
   clipboard: ClipboardLike,
+  bookmarks: ReadonlySet<string>,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -222,10 +241,15 @@ function renderCell(
     fg,
     attr: contentAttr,
   });
+  // Same ".." exclusion as ui/listView.ts's renderRow — see its comment.
+  const displayName =
+    entry.name !== ".." && bookmarks.has(entry.path)
+      ? `${entry.name}${BOOKMARK_GLYPH}`
+      : entry.name;
   screen.put(
     x + MARKER_WIDTH + ICON_WIDTH,
     y,
-    pad(truncate(entry.name, nameWidth), nameWidth),
+    pad(truncate(displayName, nameWidth), nameWidth),
     { ...rowStyle, fg, attr: contentAttr },
   );
 }
@@ -248,11 +272,12 @@ export function renderGridView(
   iconSet: IconSet,
   marked: ReadonlySet<string> = EMPTY_MARKED,
   clipboard: ClipboardLike = null,
+  bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
 ): void {
   if (width <= 0 || height <= 0 || entries.length === 0) return;
   const layout = computeGridLayout(
     width,
-    entries.map((e) => e.width),
+    entries.map((e) => entryDisplayWidth(e, bookmarks)),
   );
   if (layout.columns === 0) return;
   const rows = gridRowCount(entries.length, layout.columns);
@@ -275,6 +300,7 @@ export function renderGridView(
         iconSet,
         marked,
         clipboard,
+        bookmarks,
       );
     }
   }

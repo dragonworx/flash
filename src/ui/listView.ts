@@ -56,6 +56,7 @@ import {
   type Style,
 } from "../term/screen.ts";
 import {
+  BOOKMARK_GLYPH,
   type IconSet,
   MARK_GLYPH,
   colorFor,
@@ -112,6 +113,8 @@ const EMPTY_MARKED: ReadonlySet<string> = new Set();
 // Same reasoning, for callers that don't care about folder sizes — see
 // `sizeText` below.
 const EMPTY_DIR_SIZES: ReadonlyMap<string, number> = new Map();
+// Same reasoning, for callers that don't care about goto bookmarks.
+const EMPTY_BOOKMARKS: ReadonlySet<string> = new Set();
 
 function fixedCost(columns: ColumnKey[]): number {
   return (
@@ -249,6 +252,7 @@ function renderRow(
   marked: ReadonlySet<string>,
   clipboard: ClipboardLike,
   dirSizes: ReadonlyMap<string, number>,
+  bookmarks: ReadonlySet<string>,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -284,7 +288,14 @@ function renderRow(
     fg,
     attr: contentAttr,
   });
-  screen.put(x + nameX, y, pad(truncate(entry.name, nameWidth), nameWidth), {
+  // The synthetic ".." row never carries the bookmark star either — see the
+  // ".." mark-glyph note above; the breadcrumb's own star already covers
+  // "the directory I'm in right now is bookmarked."
+  const displayName =
+    entry.name !== ".." && bookmarks.has(entry.path)
+      ? `${entry.name}${BOOKMARK_GLYPH}`
+      : entry.name;
+  screen.put(x + nameX, y, pad(truncate(displayName, nameWidth), nameWidth), {
     ...rowStyle,
     fg,
     attr: contentAttr,
@@ -339,6 +350,7 @@ export function renderListView(
   clipboard: ClipboardLike = null,
   now: number = Date.now(),
   dirSizes: ReadonlyMap<string, number> = EMPTY_DIR_SIZES,
+  bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
 ): void {
   if (width <= 0 || height <= 0) return;
   for (let row = 0; row < height; row++) {
@@ -358,6 +370,7 @@ export function renderListView(
       marked,
       clipboard,
       dirSizes,
+      bookmarks,
     );
   }
 }

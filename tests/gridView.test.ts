@@ -9,6 +9,7 @@ import { Screen } from "../src/term/screen.ts";
 import {
   clampGridScroll,
   computeGridLayout,
+  entryDisplayWidth,
   gridRowCount,
   moveGridCursor,
   renderGridView,
@@ -28,6 +29,23 @@ function makeEntry(name: string, overrides: Partial<Entry> = {}): Entry {
     ...overrides,
   };
 }
+
+describe("entryDisplayWidth", () => {
+  it("adds the bookmark star's width for a bookmarked entry", () => {
+    const entry = makeEntry("arena-engine", { width: 12 });
+    expect(entryDisplayWidth(entry, new Set(["/tmp/arena-engine"]))).toBe(14);
+  });
+
+  it("leaves an entry's width alone when it isn't bookmarked", () => {
+    const entry = makeEntry("arena-engine", { width: 12 });
+    expect(entryDisplayWidth(entry, new Set())).toBe(12);
+  });
+
+  it("never stars the synthetic '..' row, even if its path is bookmarked", () => {
+    const entry = makeEntry("..", { path: "/tmp/parent", width: 2 });
+    expect(entryDisplayWidth(entry, new Set(["/tmp/parent"]))).toBe(2);
+  });
+});
 
 describe("computeGridLayout", () => {
   it("returns nothing for an empty entry list or non-positive width", () => {

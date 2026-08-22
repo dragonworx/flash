@@ -50,6 +50,18 @@ describe("formatBreadcrumb", () => {
   it("returns an empty string for non-positive width", () => {
     expect(formatBreadcrumb("/a/b", 0)).toBe("");
   });
+
+  it("appends the bookmark star to cwd's own segment when bookmarked", () => {
+    expect(formatBreadcrumb("/home/dev/fs", 80, null, true)).toBe(
+      "/ › home › dev › fs ★",
+    );
+  });
+
+  it("omits the star when not bookmarked", () => {
+    expect(formatBreadcrumb("/home/dev/fs", 80, null, false)).toBe(
+      "/ › home › dev › fs",
+    );
+  });
 });
 
 describe("formatItemCount", () => {

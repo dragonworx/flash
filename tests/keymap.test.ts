@@ -452,3 +452,82 @@ describe("resolveAction: preview overlay captures input", () => {
     });
   });
 });
+
+describe("resolveAction: goto bookmark ('b')", () => {
+  it("b opens the bookmark picker in the plain browser", () => {
+    expect(resolveAction(makeKey({ name: "b" }), makeState())).toEqual({
+      type: "startBookmarks",
+    });
+  });
+});
+
+describe("resolveAction: bookmarks overlay captures input", () => {
+  const bookmarksState = makeState({
+    overlay: {
+      kind: "bookmarks",
+      items: [
+        { name: "flash", path: "/home/dev/github/flash" },
+        { name: "kb", path: "/home/dev/github/kb" },
+      ],
+      cursor: 0,
+    },
+  });
+
+  it("up/down/j/k move the row cursor", () => {
+    expect(resolveAction(makeKey({ name: "down" }), bookmarksState)).toEqual({
+      type: "bookmarksMove",
+      delta: 1,
+    });
+    expect(resolveAction(makeKey({ name: "j" }), bookmarksState)).toEqual({
+      type: "bookmarksMove",
+      delta: 1,
+    });
+    expect(resolveAction(makeKey({ name: "up" }), bookmarksState)).toEqual({
+      type: "bookmarksMove",
+      delta: -1,
+    });
+    expect(resolveAction(makeKey({ name: "k" }), bookmarksState)).toEqual({
+      type: "bookmarksMove",
+      delta: -1,
+    });
+  });
+
+  it("Home/End jump to the ends of the list", () => {
+    expect(resolveAction(makeKey({ name: "home" }), bookmarksState)).toEqual({
+      type: "bookmarksMoveTo",
+      pos: "home",
+    });
+    expect(resolveAction(makeKey({ name: "end" }), bookmarksState)).toEqual({
+      type: "bookmarksMoveTo",
+      pos: "end",
+    });
+  });
+
+  it("Enter/Space select the highlighted bookmark", () => {
+    expect(resolveAction(makeKey({ name: "enter" }), bookmarksState)).toEqual({
+      type: "selectBookmark",
+    });
+    expect(resolveAction(makeKey({ name: "space" }), bookmarksState)).toEqual({
+      type: "selectBookmark",
+    });
+  });
+
+  it("b again closes it, mirroring '?' on the help overlay", () => {
+    expect(resolveAction(makeKey({ name: "b" }), bookmarksState)).toEqual({
+      type: "closeOverlay",
+    });
+  });
+
+  it("swallows keys that would copy/cut/quit in the plain browser", () => {
+    expect(resolveAction(makeKey({ name: "c" }), bookmarksState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "x" }), bookmarksState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "q" }), bookmarksState)).toBeNull();
+  });
+
+  it("Escape closes it via the ordinary precedence table (arm 1)", () => {
+    expect(resolveEscape(bookmarksState)).toEqual({ type: "closeOverlay" });
+    expect(resolveAction(makeKey({ name: "escape" }), bookmarksState)).toEqual({
+      type: "closeOverlay",
+    });
+  });
+});

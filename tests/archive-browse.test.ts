@@ -105,19 +105,19 @@ describe("leaving an archive", () => {
     await store.up();
     expect(store.getState().archive).not.toBeNull();
     expect(store.getState().archive?.innerPath).toBe("");
-    // Cursor lands back on "payload" — the entry just left.
+    // Cursor lands on the synthetic ".." row, for rapid backtracking.
     const cursorEntry = store.visibleEntries()[store.getState().cursor];
-    expect(cursorEntry?.name).toBe("payload");
+    expect(cursorEntry?.name).toBe("..");
   });
 
-  it("up() at the archive root leaves it and lands the cursor on the zip file", async () => {
+  it("up() at the archive root leaves it and lands the cursor on the '..' row", async () => {
     const store = await openArchive();
     await store.up();
     const state = store.getState();
     expect(state.archive).toBeNull();
     expect(state.cwd).toBe(realDir);
     const cursorEntry = store.visibleEntries()[state.cursor];
-    expect(cursorEntry?.name).toBe("backup.zip");
+    expect(cursorEntry?.name).toBe("..");
   });
 
   it("leaveArchive() is a no-op outside an archive", async () => {

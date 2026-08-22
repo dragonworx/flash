@@ -1,39 +1,40 @@
 // state/store.ts — AppState + actions + subscribe.
 //
 // One object, per the plan: cursor, sort spec, hidden-file toggle, marks,
-// clipboard, overlay, and the per-directory cursor history all live as
-// fields here (or as private fields on this class) rather than split across
-// modules — splitting them invites circular imports between fsapi, ui, and
-// state that the plan explicitly warns against.
+// clipboard, and overlay all live as fields here (or as private fields on
+// this class) rather than split across modules — splitting them invites
+// circular imports between fsapi, ui, and state that the plan explicitly
+// warns against.
 //
 // `Store` never touches the screen or stdout. Every action ends by calling
 // `notify()`, which is the one hook `main.ts` wires to its own dirty-flag
 // repaint scheduler (see main.ts's `requestRepaint`) — this file only sets
 // the flag main.ts already has, it does not invent a second render loop.
 //
-// Per-directory cursor history: a single `Map<dir, childName>` does double
-// duty. Descending into a directory (`enter()`) records, against the
-// directory being *left*, the name of the entry the cursor was on — which
-// is exactly the child being entered. Ascending (`up()`) looks that same
-// map up for the *destination* directory, falling back to "the directory
-// I'm leaving" when there is no recorded history (e.g. flash was launched
-// directly into a deep path via `-d`). That fallback is what makes "go up"
-// land on the directory you came from even on the very first move.
+// Every navigation — descending into a directory, going up, opening or
+// leaving an archive — lands the cursor on the synthetic ".." row (index 0
+// of `visibleEntries()`, always first when it exists) rather than trying to
+// remember where the cursor was. That is deliberate: it is what lets
+// repeated Escape/h/Backspace rapidly walk back up a tree without the
+// cursor jumping around to chase a "directory just left" target each time.
+// A same-directory reload after a mutation (rename, delete, paste, ...)
+// is a different thing entirely and goes through `refresh()`, which
+// preserves the cursor by path — see that method's comment.
 //
 // Phase 4 (selection and clipboard) changes no file on disk — `marked` and
 // `clipboard` are pure in-memory bookkeeping. `marked` is keyed by absolute
 // path, never by index: indices break the instant Phase 6's watcher
 // re-sorts the list out from under a stale index. The Shift+↑/↓ range
-// anchor is *not* on `AppState` — like `history` above, it is private
-// bookkeeping the renderers never need (see `rangeAnchor`/`rangeLastBounds`
-// below and `extendSelection()`).
+// anchor is *not* on `AppState` — it is private bookkeeping the renderers
+// never need (see `rangeAnchor`/`rangeLastBounds` below and
+// `extendSelection()`).
 //
 // Phase 5a (paste) is the first thing in this file that touches disk.
 // `paste()` is deliberately the only place `fsapi/ops/queue.ts` is called
 // from — same shape as `load()`/`enter()`/`up()` above: an async Store
 // method that awaits the fs work itself and calls `notify()` when state
 // changes, rather than main.ts reaching into fsapi directly. `pasteAbort`
-// is bookkeeping in the same spirit as `history`/`rangeAnchor`: not part of
+// is bookkeeping in the same spirit as `rangeAnchor`: not part of
 // `AppState`, because the renderer only ever needs the plain progress
 // numbers on `state.overlay`, never the controller that produced them.
 //
@@ -59,12 +60,11 @@
 //
 // Phase 6 (live updates) adds `refresh()`, the watcher's entry point,
 // deliberately separate from `load()` even though both scan a directory:
-// `load()` is a navigation — it consults/records per-directory history and
-// resets the cursor to "the first real entry" when it has nothing better to
-// go on, which is exactly right when you just walked into a directory but
-// wrong when the directory under you changed out from under you. `refresh()`
-// instead preserves the cursor by path (falling back to its old numeric
-// index, clamped, rather than jumping to the top) and prunes only the marks
+// `load()` is a navigation — it resets the cursor to the top, which is
+// exactly right when you just walked into a directory but wrong when the
+// directory under you changed out from under you. `refresh()` instead
+// preserves the cursor by path (falling back to its old numeric index,
+// clamped, rather than jumping to the top) and prunes only the marks
 // that live in the rescanned directory — marks are deliberately allowed to
 // persist across navigation (see `clipboardCandidatePaths` below), so a mark
 // on a file in some other directory must survive a rescan of whatever
@@ -88,7 +88,6 @@ import { rename as fsRename, lstat, readdir } from "node:fs/promises";
 import { basename, dirname, join } from "node:path";
 import {
   type ArchiveTree,
-  archiveBasename,
   archiveChildInner,
   archiveEntriesAt,
   archiveParentInner,
@@ -96,6 +95,7 @@ import {
   loadArchiveTree,
 } from "../fsapi/archive/vfs.ts";
 import type { Entry } from "../fsapi/entry.ts";
+import { type GotoBookmark, loadGotoBookmarks } from "../fsapi/goto.ts";
 import { chmodPreserving } from "../fsapi/ops/chmod.ts";
 import { uniqueName } from "../fsapi/ops/conflict.ts";
 import { countTree, dirSize, mkdir } from "../fsapi/ops/index.ts";
@@ -235,7 +235,18 @@ export type Overlay =
       loading: boolean;
       error: string | null;
       truncated: boolean;
-    };
+    }
+  /**
+   * The `b` key's goto bookmark picker. `items` is a snapshot of
+   * `fsapi/goto.ts`'s bookmarks taken when the overlay opened (see
+   * `startBookmarks`), not re-read live — same "load once per overlay
+   * open" shape as the preview overlay's `lines`. `cursor` indexes into
+   * `items`; there is no separate scroll-offset field, unlike
+   * `help`/`preview` — `ui/overlay/bookmarks.ts` derives the scroll window
+   * straight from `cursor` on every render, since the picker's rows are a
+   * single selectable list rather than free-scrolling text.
+   */
+  | { kind: "bookmarks"; items: GotoBookmark[]; cursor: number };
 
 export type AppState = {
   cwd: string;
@@ -285,7 +296,6 @@ const DIR_SIZE_CONCURRENCY = 4;
 export class Store {
   private state: AppState;
   private listeners = new Set<() => void>();
-  private history = new Map<string, string>(); // dir path -> selected child name
   private messageTimer: ReturnType<typeof setTimeout> | null = null;
   // Shift+↑/↓ range-select bookkeeping (Phase 4). Not part of `AppState`,
   // same as `history` above — renderers never need to know about the
@@ -341,6 +351,16 @@ export class Store {
   // controller per `scheduleDirSizeScan()` call, since a fresh navigation
   // or rescan makes the previous batch's queue stale.
   private dirSizeBatchAbort: AbortController | null = null;
+  // goto's bookmarks (`fsapi/goto.ts`), reloaded fresh off disk by
+  // `load()` (every real navigation) and `startBookmarks()` — not part of
+  // `AppState`, same reasoning as `dirSizeCache` above: the renderer only
+  // ever needs `isBookmarked()`/`bookmarkedPaths()` derived from this,
+  // never the raw list, except `startBookmarks()`, which hands the list
+  // itself to the `bookmarks` overlay. `gotoBookmarkPaths` is kept in sync
+  // alongside it so the breadcrumb star and every row's star are an O(1)
+  // Set lookup rather than an O(n) scan per entry per frame.
+  private gotoBookmarks: GotoBookmark[] = [];
+  private gotoBookmarkPaths: Set<string> = new Set();
 
   constructor(init: StoreInit) {
     this.state = {
@@ -358,6 +378,23 @@ export class Store {
       message: null,
       archive: null,
     };
+    this.refreshGotoBookmarks();
+  }
+
+  /** Re-read goto's config/usage files — see `gotoBookmarks`'s field comment. */
+  private refreshGotoBookmarks(): void {
+    this.gotoBookmarks = loadGotoBookmarks();
+    this.gotoBookmarkPaths = new Set(this.gotoBookmarks.map((b) => b.path));
+  }
+
+  /** Whether `path` (default `state.cwd`) is exactly a goto bookmark's target. */
+  isBookmarked(path: string = this.state.cwd): boolean {
+    return this.gotoBookmarkPaths.has(path);
+  }
+
+  /** Every bookmarked path, for the list/grid views' per-row star. */
+  bookmarkedPaths(): ReadonlySet<string> {
+    return this.gotoBookmarkPaths;
   }
 
   getState(): Readonly<AppState> {
@@ -471,11 +508,11 @@ export class Store {
   // ── loading ──
 
   /**
-   * Scan `dir` and replace state with the result. `preferredName`, when
-   * given, wins over recorded history for where the cursor lands (used by
-   * `up()`, which always wants to land on the directory it just left).
+   * Scan `dir` and replace state with the result — a navigation, so the
+   * cursor always resets to the top (the synthetic ".." row when present,
+   * else the first real entry) rather than trying to remember where it was.
    */
-  async load(dir: string, preferredName?: string): Promise<void> {
+  async load(dir: string): Promise<void> {
     const result = await scan(dir);
     this.state.cwd = dir;
     if (result.ok) {
@@ -486,21 +523,22 @@ export class Store {
       this.state.scanError = result.error;
     }
     this.state.scrollTop = 0;
-    this.setCursorByName(preferredName ?? this.history.get(dir));
+    this.resetCursorToTop();
+    this.refreshGotoBookmarks();
     this.scheduleDirSizeScan();
     this.notify();
   }
 
   /**
    * Re-scan `dir` in place — the watcher's entry point (Phase 6), called
-   * after every debounced `fs.watch` burst settles. Not a navigation: it
-   * never touches per-directory cursor history, and it preserves the
-   * cursor **by path** rather than resetting to the first real entry — the
-   * entry under the cursor keeps the cursor if it still exists anywhere in
-   * the refreshed listing, and when it's gone the cursor falls back to its
-   * previous numeric index, clamped into the new (possibly shorter) list,
-   * so a file deleted elsewhere in a large directory doesn't yank the
-   * cursor back to the top.
+   * after every debounced `fs.watch` burst settles, and also used by
+   * `runCopy`/`runCut` to reload after a paste/cut completes. Not a
+   * navigation: it preserves the cursor **by path** rather than resetting
+   * it to the top — the entry under the cursor keeps the cursor if it still
+   * exists anywhere in the refreshed listing, and when it's gone the cursor
+   * falls back to its previous numeric index, clamped into the new
+   * (possibly shorter) list, so a file deleted elsewhere in a large
+   * directory doesn't yank the cursor back to the top.
    *
    * Marks are pruned too, but only the ones that live *in* `dir` — a mark
    * on a file in some other directory (marks persist across navigation, see
@@ -587,15 +625,22 @@ export class Store {
         return;
       }
     }
-    // No history, or the remembered entry is gone: land on the first real
-    // entry (skip the synthetic ".." row) when there is one.
+    // No matching entry: land on the first real entry (skip the synthetic
+    // ".." row) when there is one.
     this.state.cursor = list.length > 1 ? 1 : 0;
   }
 
-  private recordHistory(): void {
-    const list = this.visibleEntries();
-    const current = list[this.state.cursor];
-    if (current) this.history.set(this.state.cwd, current.name);
+  /**
+   * Land the cursor on the synthetic ".." row (index 0 of `visibleEntries()`,
+   * always first when it exists) — or, at the filesystem root where there is
+   * no ".." row, the first real entry, which is index 0 there too. Every
+   * navigation uses this, not `setCursorByName`, so repeated Escape/h/
+   * Backspace can backtrack up a tree rapidly without the cursor landing
+   * somewhere it has to be hunted for on each step.
+   */
+  private resetCursorToTop(): void {
+    this.resetRangeAnchor();
+    this.state.cursor = 0;
   }
 
   // ── navigation ──
@@ -693,7 +738,6 @@ export class Store {
       entry.kind === "dir" ||
       (entry.kind === "symlink" && entry.targetKind === "dir");
     if (isDirLike) {
-      this.recordHistory();
       await this.load(entry.path);
       return;
     }
@@ -752,11 +796,7 @@ export class Store {
     }
     const parent = dirname(this.state.cwd);
     if (parent === this.state.cwd) return;
-    const childName = basename(this.state.cwd);
-    this.recordHistory();
-    // Prefer the directory just left over any older recorded history for
-    // the parent — that is the whole point of this method.
-    await this.load(parent, childName || undefined);
+    await this.load(parent);
   }
 
   private archiveUp(): void {
@@ -766,22 +806,19 @@ export class Store {
       this.leaveArchive();
       return;
     }
-    const childName = archiveBasename(archive.innerPath);
     this.state.archive = {
       ...archive,
       innerPath: archiveParentInner(archive.innerPath),
     };
     this.state.scrollTop = 0;
-    this.setCursorByName(childName); // lands on the directory just left, same convention as real up()
+    this.resetCursorToTop();
     this.notify();
   }
 
   /**
    * Pop back out to the real filesystem — Escape's arm 3 (keymap.ts's
    * `leaveArchive` action, reached only at the archive root) and
-   * `archiveUp()` above both resolve here. The cursor lands on the zip
-   * file itself, the same "land on what you just left" convention `up()`
-   * follows for a real directory.
+   * `archiveUp()` above both resolve here.
    */
   leaveArchive(): void {
     const archive = this.state.archive;
@@ -789,7 +826,7 @@ export class Store {
     this.state.archive = null;
     this.archiveTree = null;
     this.state.scrollTop = 0;
-    this.setCursorByName(basename(archive.zipPath));
+    this.resetCursorToTop();
     this.notify();
   }
 
@@ -1241,8 +1278,9 @@ export class Store {
       this.state.clipboard = null;
     }
     this.reportPasteOutcome(outcome, missing.length);
-    // Refresh so newly-pasted entries show up; load() notifies on its own.
-    await this.load(this.state.cwd);
+    // Same directory, just updated — refresh() preserves the cursor by
+    // path instead of resetting it like a real navigation would.
+    await this.refresh(this.state.cwd);
   }
 
   /**
@@ -1311,7 +1349,9 @@ export class Store {
       for (const src of outcome.movedSources) this.state.marked.delete(src);
     }
     this.reportCutOutcome(outcome, missing.length);
-    await this.load(this.state.cwd);
+    // Same directory, just updated — refresh() preserves the cursor by
+    // path instead of resetting it like a real navigation would.
+    await this.refresh(this.state.cwd);
   }
 
   /** Esc while the progress overlay is open (see keymap.ts's Escape precedence). */
@@ -2192,6 +2232,78 @@ export class Store {
       Math.min(overlay.scrollOffset + delta, clampedMax),
     );
     this.notify();
+  }
+
+  // ── goto bookmarks ──
+
+  /**
+   * `b`: open the goto bookmark picker, freshly re-read off disk (see
+   * `refreshGotoBookmarks`) so a bookmark added/removed/renamed via `goto
+   * -a`/`-d`/`-r` in another terminal shows up without restarting flash.
+   * Same already-open guard as `startRename`/`startMkdir`/`startHelp`. If
+   * the current directory is itself bookmarked, the picker opens with that
+   * entry already under the cursor rather than always starting at the top.
+   */
+  startBookmarks(): void {
+    if (this.state.overlay) return;
+    this.refreshGotoBookmarks();
+    if (this.gotoBookmarks.length === 0) {
+      this.setMessage("no goto bookmarks found");
+      return;
+    }
+    const cursor = Math.max(
+      0,
+      this.gotoBookmarks.findIndex((b) => b.path === this.state.cwd),
+    );
+    this.state.overlay = {
+      kind: "bookmarks",
+      items: this.gotoBookmarks,
+      cursor,
+    };
+    this.notify();
+  }
+
+  /** Esc, or `b` again (see keymap.ts's `resolveBookmarksKey`): dismiss it. */
+  closeBookmarks(): void {
+    if (this.state.overlay?.kind !== "bookmarks") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  bookmarksMove(delta: number): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "bookmarks") return;
+    overlay.cursor = Math.max(
+      0,
+      Math.min(overlay.items.length - 1, overlay.cursor + delta),
+    );
+    this.notify();
+  }
+
+  bookmarksMoveTo(pos: "home" | "end"): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "bookmarks") return;
+    overlay.cursor = pos === "home" ? 0 : overlay.items.length - 1;
+    this.notify();
+  }
+
+  /**
+   * Enter on the bookmark picker: close the overlay and jump the file view
+   * to the selected bookmark's path via `load()` — a real navigation, same
+   * as walking there by hand, so cwd/OSC-announce/watcher-retarget (all
+   * driven off main.ts's `store.subscribe` seeing `cwd` change) all follow
+   * along for free.
+   */
+  async selectBookmark(): Promise<void> {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "bookmarks") return;
+    const target = overlay.items[overlay.cursor];
+    this.state.overlay = null;
+    if (!target) {
+      this.notify();
+      return;
+    }
+    await this.load(target.path);
   }
 
   // ── messages ──

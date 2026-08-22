@@ -1,5 +1,5 @@
-// tests/store.test.ts — state/store.ts: navigation, the per-directory
-// cursor history that makes "up" land back on the directory you came from,
+// tests/store.test.ts — state/store.ts: navigation (every real move lands
+// the cursor on the synthetic ".." row so repeated up-navigation is fast),
 // hidden-file toggling, and sort cycling. Runs against a throwaway temp
 // tree rather than tests/fixtures/sample, since it needs nested
 // directories the committed fixture deliberately keeps shallow.
@@ -43,11 +43,11 @@ async function makeLoadedStore(cwd: string = root): Promise<Store> {
 }
 
 describe("Store.load", () => {
-  it("lands the cursor on the first real entry, not the synthetic '..' row", async () => {
+  it("lands the cursor on the synthetic '..' row", async () => {
     const store = await makeLoadedStore();
     const list = store.visibleEntries();
     expect(list[0]?.name).toBe(".."); // parent row always first
-    expect(store.getState().cursor).toBe(1);
+    expect(store.getState().cursor).toBe(0);
   });
 
   it("excludes dotfiles from itemCount and visibleEntries by default", async () => {
@@ -166,7 +166,7 @@ describe("Store navigation", () => {
     expect(store.getState().cwd).toBe(join(root, "alpha"));
   });
 
-  it("up() lands the cursor back on the directory just left", async () => {
+  it("up() lands the cursor on the synthetic '..' row, for rapid backtracking", async () => {
     const store = await makeLoadedStore();
     const idx = store.visibleEntries().findIndex((e) => e.name === "beta");
     store.moveCursorTo("home");
@@ -176,8 +176,9 @@ describe("Store navigation", () => {
 
     await store.up();
     expect(store.getState().cwd).toBe(root);
+    expect(store.getState().cursor).toBe(0);
     const current = store.visibleEntries()[store.getState().cursor];
-    expect(current?.name).toBe("beta");
+    expect(current?.name).toBe("..");
   });
 
   it("up() at the filesystem root is a no-op", async () => {
@@ -690,7 +691,7 @@ describe("Store.refresh", () => {
     }
   });
 
-  it("does not touch per-directory cursor history the way load() does", async () => {
+  it("does not disturb subsequent navigation's cursor placement", async () => {
     const root = mkdtempSync(join(tmpdir(), "flash-store-refresh-test-"));
     try {
       mkdirSync(join(root, "child"));
@@ -703,12 +704,13 @@ describe("Store.refresh", () => {
       await store.enter();
       expect(store.getState().cwd).toBe(join(root, "child"));
 
-      // A rescan of the child directory must not disturb root's recorded
-      // "cursor was on child" history.
+      // A rescan of the child directory must not disturb where up()
+      // lands the cursor afterward — the synthetic ".." row, as always.
       await store.refresh(join(root, "child"));
       await store.up();
+      expect(store.getState().cwd).toBe(root);
       const current = store.visibleEntries()[store.getState().cursor];
-      expect(current?.name).toBe("child");
+      expect(current?.name).toBe("..");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -803,5 +805,105 @@ describe("Store: text preview (Enter on a plain file)", () => {
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }
+  });
+});
+
+describe("Store: goto bookmarks", () => {
+  let gotoHome: string;
+  let originalGotoHome: string | undefined;
+
+  beforeAll(() => {
+    gotoHome = mkdtempSync(join(tmpdir(), "flash-store-goto-test-"));
+    writeFileSync(
+      join(gotoHome, "config.json"),
+      JSON.stringify({ alpha: join(root, "alpha"), beta: join(root, "beta") }),
+    );
+    originalGotoHome = process.env.GOTO_HOME;
+    process.env.GOTO_HOME = gotoHome;
+  });
+
+  afterAll(() => {
+    if (originalGotoHome === undefined) {
+      // biome-ignore lint/performance/noDelete: matches tests/config.test.ts
+      delete process.env.GOTO_HOME;
+    } else {
+      process.env.GOTO_HOME = originalGotoHome;
+    }
+    rmSync(gotoHome, { recursive: true, force: true });
+  });
+
+  it("isBookmarked is true only for a bookmarked cwd", async () => {
+    const store = await makeLoadedStore(join(root, "alpha"));
+    expect(store.isBookmarked()).toBe(true);
+    await store.load(root);
+    expect(store.isBookmarked()).toBe(false);
+  });
+
+  it("bookmarkedPaths lists every bookmark's target", async () => {
+    const store = await makeLoadedStore();
+    const paths = store.bookmarkedPaths();
+    expect(paths.has(join(root, "alpha"))).toBe(true);
+    expect(paths.has(join(root, "beta"))).toBe(true);
+    expect(paths.size).toBe(2);
+  });
+
+  it("startBookmarks opens the picker, pre-selecting the current bookmark", async () => {
+    const store = await makeLoadedStore(join(root, "beta"));
+    store.startBookmarks();
+    const overlay = store.getState().overlay;
+    expect(overlay?.kind).toBe("bookmarks");
+    if (overlay?.kind !== "bookmarks") return;
+    expect(overlay.items).toEqual([
+      { name: "alpha", path: join(root, "alpha") },
+      { name: "beta", path: join(root, "beta") },
+    ]);
+    expect(overlay.items[overlay.cursor]?.name).toBe("beta");
+  });
+
+  it("startBookmarks sets a message and opens no overlay when there are none", async () => {
+    const emptyGotoHome = mkdtempSync(
+      join(tmpdir(), "flash-store-goto-empty-"),
+    );
+    const prev = process.env.GOTO_HOME;
+    process.env.GOTO_HOME = emptyGotoHome;
+    try {
+      const store = await makeLoadedStore();
+      store.startBookmarks();
+      expect(store.getState().overlay).toBeNull();
+      expect(store.getState().message?.text).toBe("no goto bookmarks found");
+    } finally {
+      process.env.GOTO_HOME = prev;
+      rmSync(emptyGotoHome, { recursive: true, force: true });
+    }
+  });
+
+  it("bookmarksMove clamps within the list, bookmarksMoveTo jumps to the ends", async () => {
+    const store = await makeLoadedStore();
+    store.startBookmarks();
+    store.bookmarksMoveTo("home");
+    expect((store.getState().overlay as { cursor: number }).cursor).toBe(0);
+    store.bookmarksMove(-5);
+    expect((store.getState().overlay as { cursor: number }).cursor).toBe(0);
+    store.bookmarksMoveTo("end");
+    expect((store.getState().overlay as { cursor: number }).cursor).toBe(1);
+    store.bookmarksMove(5);
+    expect((store.getState().overlay as { cursor: number }).cursor).toBe(1);
+  });
+
+  it("selectBookmark closes the overlay and navigates to the selected path", async () => {
+    const store = await makeLoadedStore();
+    store.startBookmarks();
+    store.bookmarksMoveTo("home"); // "alpha"
+    await store.selectBookmark();
+    expect(store.getState().overlay).toBeNull();
+    expect(store.getState().cwd).toBe(join(root, "alpha"));
+  });
+
+  it("closeBookmarks dismisses the picker without navigating", async () => {
+    const store = await makeLoadedStore();
+    store.startBookmarks();
+    store.closeBookmarks();
+    expect(store.getState().overlay).toBeNull();
+    expect(store.getState().cwd).toBe(root);
   });
 });

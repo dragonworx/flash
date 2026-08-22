@@ -53,6 +53,7 @@ import {
 import {
   clampGridScroll,
   computeGridLayout,
+  entryDisplayWidth,
   gridRowCount,
   moveGridCursor,
   renderGridView,
@@ -62,6 +63,7 @@ import {
   renderListHeader,
   renderListView,
 } from "./ui/listView.ts";
+import { renderBookmarksOverlay } from "./ui/overlay/bookmarks.ts";
 import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
 import { maxHelpScroll, renderHelpOverlay } from "./ui/overlay/help.ts";
 import { renderPermissionsOverlay } from "./ui/overlay/permissions.ts";
@@ -300,7 +302,14 @@ function draw(screen: Screen): void {
   const state = store.getState();
   const frame = computeFrame(w, h, state.view);
 
-  renderBanner(screen, w, frame, state.cwd, state.archive);
+  renderBanner(
+    screen,
+    w,
+    frame,
+    state.cwd,
+    state.archive,
+    store.isBookmarked(),
+  );
   const listEntries = state.view === "list" ? store.visibleEntries() : [];
   // Computed once and threaded through both the header and the row
   // rendering below — never recomputed separately — so the two can never
@@ -325,9 +334,10 @@ function draw(screen: Screen): void {
       );
     } else if (state.view === "grid") {
       const entries = store.visibleEntries();
+      const bookmarks = store.bookmarkedPaths();
       const layout = computeGridLayout(
         w,
-        entries.map((e) => e.width),
+        entries.map((e) => entryDisplayWidth(e, bookmarks)),
       );
       const rows = gridRowCount(entries.length, layout.columns);
       const cursorRow = layout.columns > 0 ? state.cursor % rows : 0;
@@ -349,6 +359,7 @@ function draw(screen: Screen): void {
         iconSet,
         state.marked,
         state.clipboard,
+        store.bookmarkedPaths(),
       );
     } else if (listLayout !== null) {
       store.ensureVisible(frame.listHeight);
@@ -368,6 +379,7 @@ function draw(screen: Screen): void {
         after.clipboard,
         Date.now(),
         store.dirSizes(),
+        store.bookmarkedPaths(),
       );
     }
   }
@@ -420,6 +432,8 @@ function draw(screen: Screen): void {
     renderHelpOverlay(screen, w, h, state.overlay.scrollOffset);
   } else if (state.overlay?.kind === "preview") {
     renderPreviewOverlay(screen, w, h, state.overlay);
+  } else if (state.overlay?.kind === "bookmarks") {
+    renderBookmarksOverlay(screen, w, h, state.overlay);
   }
 
   screen.flush();
@@ -594,9 +608,10 @@ function handleNavigate(dir: "up" | "down" | "left" | "right"): void {
   }
 
   const entries = store.visibleEntries();
+  const bookmarks = store.bookmarkedPaths();
   const layout = computeGridLayout(
     Math.max(screen.columns, 1),
-    entries.map((e) => e.width),
+    entries.map((e) => entryDisplayWidth(e, bookmarks)),
   );
   if (layout.columns === 0) return;
   const rows = gridRowCount(entries.length, layout.columns);
@@ -717,6 +732,7 @@ input.onKey((key: Key) => {
       else if (overlay?.kind === "permissions") store.cancelPermissions();
       else if (overlay?.kind === "help") store.closeHelp();
       else if (overlay?.kind === "preview") store.cancelPreview();
+      else if (overlay?.kind === "bookmarks") store.closeBookmarks();
       break;
     }
     case "startRename":
@@ -797,6 +813,20 @@ input.onKey((key: Key) => {
       break;
     case "leaveArchive":
       store.leaveArchive();
+      break;
+    case "startBookmarks":
+      store.startBookmarks();
+      break;
+    case "bookmarksMove":
+      store.bookmarksMove(action.delta);
+      break;
+    case "bookmarksMoveTo":
+      store.bookmarksMoveTo(action.pos);
+      break;
+    case "selectBookmark":
+      store
+        .selectBookmark()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
   }
 });

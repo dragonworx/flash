@@ -34,7 +34,7 @@ import { basename } from "node:path";
 import { formatSize } from "../fsapi/entry.ts";
 import type { Message } from "../state/store.ts";
 import { ATTR_BOLD, type Screen, type Style } from "../term/screen.ts";
-import { colors } from "../term/theme.ts";
+import { BOOKMARK_GLYPH, colors } from "../term/theme.ts";
 import { pad, stringWidth, truncate } from "../term/width.ts";
 
 // ── breadcrumb ──
@@ -55,12 +55,25 @@ type Segment = { text: string; isArchive: boolean };
 /** `pathSegments(cwd)` plus, when browsing an archive, its own segments —
  * the zip's basename followed by each `innerPath` component — tagged so
  * `renderBreadcrumb` can style them distinctly from the real filesystem
- * path they're appended to. */
+ * path they're appended to. `bookmarked` (whether `cwd` itself is a goto
+ * bookmark — see `fsapi/goto.ts`) appends `BOOKMARK_GLYPH` to `cwd`'s own
+ * last segment specifically, never an archive segment: `cwd` never changes
+ * while browsing inside a zip (see state/store.ts's file header), so "this
+ * directory is bookmarked" always refers to the real filesystem path, not
+ * wherever the archive cursor happens to be. */
 function toSegments(
   cwd: string,
   archive?: ArchiveBreadcrumb | null,
+  bookmarked?: boolean,
 ): Segment[] {
-  const real = pathSegments(cwd).map((text) => ({ text, isArchive: false }));
+  const realParts = pathSegments(cwd);
+  const real = realParts.map((text, i) => ({
+    text:
+      bookmarked && i === realParts.length - 1
+        ? `${text}${BOOKMARK_GLYPH}`
+        : text,
+    isArchive: false,
+  }));
   if (!archive) return real;
   const inner = archive.innerPath
     ? archive.innerPath.split("/").filter((p) => p.length > 0)
@@ -125,8 +138,9 @@ export function formatBreadcrumb(
   cwd: string,
   maxWidth: number,
   archive?: ArchiveBreadcrumb | null,
+  bookmarked?: boolean,
 ): string {
-  return collapseSegments(toSegments(cwd, archive), maxWidth)
+  return collapseSegments(toSegments(cwd, archive, bookmarked), maxWidth)
     .map((s) => s.text)
     .join(CHEVRON);
 }
@@ -149,8 +163,9 @@ export function renderBreadcrumb(
   width: number,
   cwd: string,
   archive?: ArchiveBreadcrumb | null,
+  bookmarked?: boolean,
 ): void {
-  const parts = collapseSegments(toSegments(cwd, archive), width);
+  const parts = collapseSegments(toSegments(cwd, archive, bookmarked), width);
   if (parts.length === 0) return;
   const lastIdx = parts.length - 1;
 
@@ -305,6 +320,7 @@ export function renderBanner(
   frame: Frame,
   cwd: string,
   archive?: ArchiveBreadcrumb | null,
+  bookmarked?: boolean,
 ): void {
   if (frame.border && frame.bannerTopY !== null) {
     screen.box(0, frame.bannerTopY, width, 3, { fg: colors.chrome });
@@ -315,10 +331,19 @@ export function renderBanner(
       Math.max(width - 4, 0),
       cwd,
       archive,
+      bookmarked,
     );
     return;
   }
-  renderBreadcrumb(screen, 0, frame.breadcrumbY, width, cwd, archive);
+  renderBreadcrumb(
+    screen,
+    0,
+    frame.breadcrumbY,
+    width,
+    cwd,
+    archive,
+    bookmarked,
+  );
   if (frame.bannerRuleY !== null) renderRule(screen, frame.bannerRuleY, width);
 }
 

@@ -132,7 +132,17 @@ export type Action =
   | { type: "permMoveFocus"; dir: "up" | "down" | "left" | "right" }
   | { type: "permToggle" }
   | { type: "permDigit"; digit: number }
-  | { type: "permApply" };
+  | { type: "permApply" }
+  // The `b` key's goto bookmark picker (state/store.ts's `startBookmarks`).
+  // `bookmarksMove`/`bookmarksMoveTo` only ever fire while
+  // `state.overlay?.kind === "bookmarks"` (see `resolveBookmarksKey`
+  // below), same shape as `helpScroll`'s Home/End oversized-delta
+  // convention doesn't apply here — the picker is a discrete row cursor,
+  // not free-scrolling text, so Home/End get their own action instead.
+  | { type: "startBookmarks" }
+  | { type: "bookmarksMove"; delta: number }
+  | { type: "bookmarksMoveTo"; pos: "home" | "end" }
+  | { type: "selectBookmark" };
 
 // ── the bindings table ──
 //
@@ -303,6 +313,13 @@ export const BINDINGS: KeyBinding[] = [
     category: "navigation",
     matches: bare("end"),
     action: () => ({ type: "moveCursorTo", pos: "end" }),
+  },
+  {
+    display: ["b"],
+    description: "Open goto bookmarks and jump to one",
+    category: "navigation",
+    matches: bare("b"),
+    action: () => ({ type: "startBookmarks" }),
   },
 
   // ── file operations ──
@@ -565,6 +582,40 @@ function resolvePermissionsKey(key: Key): Action | null {
   }
 }
 
+/**
+ * The `b` bookmark picker captures every key except Escape (handled
+ * unconditionally before this ever runs, same as every other overlay) —
+ * up/down move the row cursor, Enter/Space jumps to it, `b` toggles it
+ * closed again (the same "its own open key also closes it" convenience
+ * `?` gives the help overlay), everything else is swallowed.
+ */
+function resolveBookmarksKey(key: Key): Action | null {
+  if (key.ctrl || key.alt) return null;
+  switch (key.name) {
+    case "up":
+    case "k":
+      return { type: "bookmarksMove", delta: -1 };
+    case "down":
+    case "j":
+      return { type: "bookmarksMove", delta: 1 };
+    case "pageup":
+      return { type: "bookmarksMove", delta: -10 };
+    case "pagedown":
+      return { type: "bookmarksMove", delta: 10 };
+    case "home":
+      return { type: "bookmarksMoveTo", pos: "home" };
+    case "end":
+      return { type: "bookmarksMoveTo", pos: "end" };
+    case "enter":
+    case "space":
+      return { type: "selectBookmark" };
+    case "b":
+      return { type: "closeOverlay" };
+    default:
+      return null;
+  }
+}
+
 // A scroll step big enough that clamping it against any real content length
 // is equivalent to "jump to the very top/bottom" — Home/End reuse the same
 // `helpScroll` action as ↑/↓/j/k/PgUp/PgDn rather than needing their own
@@ -684,6 +735,7 @@ export function resolveAction(key: Key, state: AppState): Action | null {
   if (state.overlay?.kind === "permissions") return resolvePermissionsKey(key);
   if (state.overlay?.kind === "help") return resolveHelpKey(key);
   if (state.overlay?.kind === "preview") return resolvePreviewKey(key);
+  if (state.overlay?.kind === "bookmarks") return resolveBookmarksKey(key);
   for (const binding of BINDINGS) {
     if (binding.matches(key)) return binding.action(key);
   }
