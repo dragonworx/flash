@@ -136,3 +136,54 @@ export async function countTree(
   await walk(target);
   return { count, capped };
 }
+
+/**
+ * Total bytes of everything under `target` (not `target` itself), recursed
+ * depth-first — the number the footer needs for a selected directory, since
+ * `Entry.size` there is just the raw inode size (see fsapi/entry.ts and
+ * ui/listView.ts's `sizeText`). Symlinks contribute their own link size and
+ * are never followed, matching how a symlink-to-a-directory is already
+ * excluded from the file total in state/store.ts's `selectedSize`. An
+ * unreadable subdirectory just stops descending there, same as `countTree`
+ * above, so one permission error partway down doesn't discard every byte
+ * counted before it. Cancellable via `opts.signal` for the same reason
+ * `remove`/`countTree` are — the caller aborts as soon as the selection
+ * moves on, so a huge tree doesn't keep churning after it's no longer
+ * wanted.
+ */
+export async function dirSize(
+  target: string,
+  opts: { signal?: AbortSignal } = {},
+): Promise<number> {
+  const { signal } = opts;
+  let total = 0;
+
+  async function walk(dir: string): Promise<void> {
+    if (signal?.aborted) return;
+    let children: string[];
+    try {
+      children = await readdir(dir);
+    } catch {
+      return;
+    }
+    for (const child of children) {
+      if (signal?.aborted) return;
+      const full = join(dir, child);
+      let isDir = false;
+      try {
+        const st = await lstat(full);
+        isDir = st.isDirectory();
+        if (!isDir) total += st.size;
+      } catch {
+        continue;
+      }
+      if (isDir) {
+        await Promise.resolve(); // yield between directories — see the file header
+        await walk(full);
+      }
+    }
+  }
+
+  await walk(target);
+  return total;
+}

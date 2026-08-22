@@ -31,6 +31,7 @@
 // `ClipboardLike` below and in ui/listView.ts.
 
 import { basename } from "node:path";
+import { formatSize } from "../fsapi/entry.ts";
 import type { Message } from "../state/store.ts";
 import { ATTR_BOLD, type Screen, type Style } from "../term/screen.ts";
 import { colors } from "../term/theme.ts";
@@ -333,6 +334,8 @@ export type StatusInfo = {
   /** Structural, not imported from state/store.ts — see ui/listView.ts's file header. */
   clipboard?: { mode: "copy" | "cut"; paths: string[] } | null;
   message?: Message | null;
+  /** Total bytes of the marked-or-cursor selection — see `Store.selectedSize`. */
+  selectedSize?: number;
 };
 
 /**
@@ -354,6 +357,25 @@ export function formatStatusLeft(info: StatusInfo): string {
 }
 
 /**
+ * The right-hand status text when there is no transient message to show:
+ * the marked-or-cursor selection's total size, with a trailing space so it
+ * doesn't sit flush against the right edge. Empty when there's nothing to
+ * show (no bytes — e.g. nothing selected). `formatSize`'s bare unit letters
+ * (`K`/`M`/`G`/...) match `ls -lh`'s column convention, which reads as
+ * ambiguous standing alone in the footer, so every result — including a
+ * sub-1024 byte count, which `formatSize` leaves with no letter at all —
+ * is split from its unit letter and rejoined as "value Xb", e.g. "1.5 Kb"
+ * or "3 b".
+ */
+export function formatStatusRight(bytes: number): string {
+  if (bytes <= 0) return "";
+  const size = formatSize(bytes);
+  const unit = size.match(/[A-Z]$/)?.[0] ?? "";
+  const value = unit ? size.slice(0, -1) : size;
+  return `${value} ${unit}b `;
+}
+
+/**
  * The status bar as a footer: painted with `colors.footerBg` across the
  * full width (even where no text reaches) so it reads as a strip, not a
  * stray last line — `renderRule` above already separates it from the body
@@ -368,7 +390,7 @@ export function renderStatusBar(
 ): void {
   const style: Style = { bg: colors.footerBg };
   const left = formatStatusLeft(info);
-  screen.put(x, y, pad(left, width), { ...style, fg: colors.dim });
+  screen.put(x, y, pad(` ${left}`, width), { ...style, fg: colors.dim });
 
   if (info.message) {
     const msgStyle: Style = {
@@ -378,5 +400,12 @@ export function renderStatusBar(
     const text = truncate(info.message.text, width);
     const startX = x + Math.max(width - stringWidth(text), 0);
     screen.put(startX, y, text, msgStyle);
+  } else {
+    const sizeText = formatStatusRight(info.selectedSize ?? 0);
+    if (sizeText) {
+      const text = truncate(sizeText, width);
+      const startX = x + Math.max(width - stringWidth(text), 0);
+      screen.put(startX, y, text, { ...style, fg: colors.dim });
+    }
   }
 }

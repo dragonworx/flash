@@ -98,7 +98,7 @@ import {
 import type { Entry } from "../fsapi/entry.ts";
 import { chmodPreserving } from "../fsapi/ops/chmod.ts";
 import { uniqueName } from "../fsapi/ops/conflict.ts";
-import { countTree, mkdir } from "../fsapi/ops/index.ts";
+import { countTree, dirSize, mkdir } from "../fsapi/ops/index.ts";
 import type {
   CreateArchiveOutcome,
   CutOutcome,
@@ -113,6 +113,7 @@ import {
   runExtractArchiveJob,
   runPasteJob,
 } from "../fsapi/ops/queue.ts";
+import { previewFile } from "../fsapi/preview.ts";
 import {
   DEFAULT_SORT,
   SORT_KEYS,
@@ -121,6 +122,7 @@ import {
   scan,
   sortEntries,
 } from "../fsapi/scan.ts";
+import { type StyledSegment, parseAnsiLines } from "../term/ansiParse.ts";
 import { graphemes, stringWidth } from "../term/width.ts";
 import {
   backspace as fieldBackspace,
@@ -214,6 +216,25 @@ export type Overlay =
       digitCount: number;
       focus: number;
       error: string | null;
+    }
+  /**
+   * Enter on a regular file (or a symlink resolving to one) outside an
+   * archive: pipes the file through `fsapi/preview.ts`'s `previewFile()`
+   * (bat when it's on PATH, cat otherwise) and parses whatever comes back
+   * into `lines` once, via `term/ansiParse.ts` — not per frame, so
+   * scrolling just slices the already-parsed array. `loading` is true only
+   * for the span between `startPreview()` opening the overlay and the
+   * subprocess resolving; `error` is set instead of `lines` being filled in
+   * when the subprocess fails (missing file, permission denied, ...).
+   */
+  | {
+      kind: "preview";
+      path: string;
+      lines: StyledSegment[][];
+      scrollOffset: number;
+      loading: boolean;
+      error: string | null;
+      truncated: boolean;
     };
 
 export type AppState = {
@@ -253,6 +274,12 @@ const MARK_ADVANCE = 1;
 // the UI" requirement.
 const DELETE_COUNT_CAP = 1000;
 
+// How many directory-size walks `scheduleDirSizeScan` runs at once. A
+// listing full of subdirectories (a big `node_modules`, say) would otherwise
+// fire one recursive filesystem walk per row simultaneously; this caps it to
+// a handful of workers pulling from a shared queue instead.
+const DIR_SIZE_CONCURRENCY = 4;
+
 // ── Store ──
 
 export class Store {
@@ -284,6 +311,12 @@ export class Store {
   // above: conceptually distinct operations, sharing only `ops/queue.ts`'s
   // `jobInFlight` guarantee that at most one of the three is ever set.
   private archiveAbort: AbortController | null = null;
+  // Same shape again, for `startPreview()` (Enter on a text file) — a
+  // fourth, separate field for the same reason `deleteAbort`/`archiveAbort`
+  // aren't reuses of `pasteAbort`: a conceptually distinct operation,
+  // sharing only the guarantee that a stray keypress can't stack overlays
+  // (`startPreview` refuses outright while any overlay is already open).
+  private previewAbort: AbortController | null = null;
   // The parsed member list for `state.archive?.zipPath` (Phase 8), loaded
   // once by `openArchive()` and reused for every navigation inside it —
   // not part of `AppState`, same reasoning as `history`/`rangeAnchor`
@@ -291,6 +324,23 @@ export class Store {
   // derives from this, never the tree itself. `null` whenever
   // `state.archive` is `null`.
   private archiveTree: ArchiveTree | null = null;
+  // Recursive byte totals for every directory `state.entries` has ever
+  // contained, keyed by absolute path — both the list view's Size column
+  // and `selectedSize()`'s footer total read straight from this cache
+  // rather than each walking the filesystem themselves. Filled in by
+  // `scheduleDirSizeScan()`, a bounded-concurrency background walk
+  // (`fsapi/ops/index.ts`'s `dirSize()`) kicked off from `load()`/
+  // `refresh()`; entries persist across navigation so revisiting a
+  // directory doesn't re-walk it. A path not in the cache — still queued,
+  // the synthetic ".." row (never queued, real path or not), or an
+  // archive-internal entry (the scan only ever queues real filesystem
+  // paths from `state.entries`) — just reads as "not computed yet", same
+  // as before this cache existed.
+  private dirSizeCache = new Map<string, number>();
+  // Cancels every worker of the in-flight batch at once — one shared
+  // controller per `scheduleDirSizeScan()` call, since a fresh navigation
+  // or rescan makes the previous batch's queue stale.
+  private dirSizeBatchAbort: AbortController | null = null;
 
   constructor(init: StoreInit) {
     this.state = {
@@ -437,6 +487,7 @@ export class Store {
     }
     this.state.scrollTop = 0;
     this.setCursorByName(preferredName ?? this.history.get(dir));
+    this.scheduleDirSizeScan();
     this.notify();
   }
 
@@ -498,6 +549,14 @@ export class Store {
         `${dropped} mark${dropped === 1 ? "" : "s"} dropped — file${dropped === 1 ? "" : "s"} no longer here`,
       );
     }
+    // A rescan can mean a listed directory's own contents changed even
+    // though its path didn't — drop cached totals for entries directly
+    // inside `dir` so they're recomputed; cached totals for directories
+    // elsewhere in the tree are untouched and stay valid.
+    for (const p of [...this.dirSizeCache.keys()]) {
+      if (dirname(p) === dir) this.dirSizeCache.delete(p);
+    }
+    this.scheduleDirSizeScan();
     this.notify();
   }
 
@@ -594,14 +653,20 @@ export class Store {
   /**
    * Enter the entry under the cursor if it is a directory, or a symlink
    * resolving to one (`targetKind === "dir"`) — Phase 2 is read-only
-   * browsing, so anything else is a no-op. Selecting the ".." row goes up.
+   * browsing. Selecting the ".." row goes up.
    *
    * Phase 8 adds two more cases, checked first: while `state.archive` is
    * set, this only ever descends within the already-open archive (a leaf
    * file inside one stays inert, same as a plain file outside one — this
-   * app has no "open" action for file contents anywhere); otherwise, a
-   * real `.zip` file under the cursor is opened via `openArchive()` instead
-   * of being a no-op the way any other non-directory entry is.
+   * app has no "open" action for archive-internal file contents); otherwise,
+   * a real `.zip` file under the cursor is opened via `openArchive()`
+   * instead of being previewed like any other file.
+   *
+   * The text preview feature adds the last case: a plain file (or a symlink
+   * resolving to one) outside an archive opens `startPreview()` instead of
+   * being a no-op — see `isPreviewable()`, which excludes device/socket/
+   * fifo entries (`kind === "other"`), broken symlinks, and anything scan.ts
+   * already flagged with `entry.error`.
    */
   async enter(): Promise<void> {
     const list = this.visibleEntries();
@@ -634,7 +699,18 @@ export class Store {
     }
     if (isZipFile(entry)) {
       await this.openArchive(entry.path);
+      return;
     }
+    if (this.isPreviewable(entry)) {
+      await this.startPreview(entry.path);
+    }
+  }
+
+  /** A regular file, or a symlink resolving to one — `enter()`'s preview case. */
+  private isPreviewable(entry: Entry): boolean {
+    if (entry.error) return false;
+    if (entry.kind === "file") return true;
+    return entry.kind === "symlink" && entry.targetKind === "file";
   }
 
   /**
@@ -714,6 +790,90 @@ export class Store {
     this.archiveTree = null;
     this.state.scrollTop = 0;
     this.setCursorByName(basename(archive.zipPath));
+    this.notify();
+  }
+
+  // ── preview (text file, Enter on a plain file) ──
+
+  /**
+   * Open the preview overlay for `path` and kick off `fsapi/preview.ts`'s
+   * `previewFile()` (bat if it's on PATH, cat otherwise). Same already-open
+   * guard every other `startX` method uses, so a stray keypress mid-load
+   * can't stack overlays. The overlay opens immediately with `loading:
+   * true` — the subprocess is real I/O, not instant — and this method
+   * fills in `lines`/`error` once it resolves.
+   *
+   * Cancellation follows the exact `pasteAbort` pattern (see that field's
+   * comment): `previewAbort !== abort` after the await means a newer call —
+   * or `cancelPreview()` — superseded this one, so its result must never
+   * overwrite whatever's on screen now.
+   */
+  async startPreview(path: string): Promise<void> {
+    if (this.state.overlay) return;
+    const abort = new AbortController();
+    this.previewAbort = abort;
+    this.state.overlay = {
+      kind: "preview",
+      path,
+      lines: [],
+      scrollOffset: 0,
+      loading: true,
+      error: null,
+      truncated: false,
+    };
+    this.notify();
+
+    const result = await previewFile(path, { signal: abort.signal });
+    if (this.previewAbort !== abort) return;
+    this.previewAbort = null;
+    if (
+      this.state.overlay?.kind !== "preview" ||
+      this.state.overlay.path !== path
+    ) {
+      return;
+    }
+
+    if (!result.ok) {
+      this.state.overlay = {
+        ...this.state.overlay,
+        loading: false,
+        error: result.error,
+      };
+    } else {
+      this.state.overlay = {
+        ...this.state.overlay,
+        loading: false,
+        lines: parseAnsiLines(result.raw),
+        truncated: result.truncated,
+      };
+    }
+    this.notify();
+  }
+
+  /** Esc on the preview overlay (see keymap.ts's Escape precedence): abort a still-loading fetch and close. */
+  cancelPreview(): void {
+    this.previewAbort?.abort();
+    this.previewAbort = null;
+    if (this.state.overlay?.kind !== "preview") return;
+    this.state.overlay = null;
+    this.notify();
+  }
+
+  /**
+   * Move the preview overlay's scroll position by `delta` lines, clamped to
+   * `[0, maxScrollOffset]` — `maxScrollOffset` is computed by the caller
+   * (main.ts, via `ui/overlay/preview.ts`'s `maxPreviewScroll`) from the
+   * terminal size and `state.overlay.lines.length`, the same pattern
+   * `helpScroll` already uses for the help overlay.
+   */
+  previewScroll(delta: number, maxScrollOffset: number): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "preview") return;
+    const clampedMax = Math.max(0, maxScrollOffset);
+    overlay.scrollOffset = Math.max(
+      0,
+      Math.min(overlay.scrollOffset + delta, clampedMax),
+    );
     this.notify();
   }
 
@@ -913,6 +1073,85 @@ export class Store {
     const entry = list[this.state.cursor];
     if (!entry || entry.name === "..") return [];
     return [entry.path];
+  }
+
+  /** A directory (or a symlink to one) — the entries `dirSizeCache` prices. */
+  private isSizableDir(entry: Entry): boolean {
+    return (
+      entry.kind === "dir" ||
+      (entry.kind === "symlink" && entry.targetKind === "dir")
+    );
+  }
+
+  /**
+   * Total bytes of the marked-or-cursor selection (same fallback as
+   * `clipboardCandidatePaths`), for the footer's size readout. Files sum
+   * directly from `entry.size`; a directory's contribution comes from
+   * `dirSizeCache` instead — same cache, same numbers, `listView.ts`'s Size
+   * column reads via `dirSizes()` — and is `0` until that entry's walk
+   * resolves.
+   */
+  selectedSize(): number {
+    const paths = new Set(this.clipboardCandidatePaths());
+    if (paths.size === 0) return 0;
+    let total = 0;
+    for (const entry of this.visibleEntries()) {
+      if (!paths.has(entry.path) || entry.error) continue;
+      total += this.isSizableDir(entry)
+        ? (this.dirSizeCache.get(entry.path) ?? 0)
+        : entry.size;
+    }
+    return total;
+  }
+
+  /** The list view's Size column and `selectedSize()` both read directory totals off this. */
+  dirSizes(): ReadonlyMap<string, number> {
+    return this.dirSizeCache;
+  }
+
+  /**
+   * Walk every directory `state.entries` currently lists (bounded
+   * concurrency, so a directory full of subdirectories doesn't fire a
+   * filesystem walk per entry all at once) and fill `dirSizeCache` in as
+   * each one resolves — the list view's Size column and the footer's
+   * selection total both just read the cache, so neither has to know a
+   * walk is even happening. Called from `load()` and `refresh()`, i.e.
+   * whenever `state.entries` changes; already-cached paths (a directory
+   * revisited, or one a rescan didn't touch) are skipped, and any batch
+   * still in flight is aborted first — its queue belongs to a listing that
+   * no longer applies.
+   */
+  private scheduleDirSizeScan(): void {
+    this.dirSizeBatchAbort?.abort();
+    const abort = new AbortController();
+    this.dirSizeBatchAbort = abort;
+
+    const queue = this.state.entries
+      .filter((e) => this.isSizableDir(e) && !this.dirSizeCache.has(e.path))
+      .map((e) => e.path);
+    if (queue.length === 0) return;
+
+    const workerCount = Math.min(DIR_SIZE_CONCURRENCY, queue.length);
+    for (let i = 0; i < workerCount; i++) this.runDirSizeWorker(queue, abort);
+  }
+
+  private async runDirSizeWorker(
+    queue: string[],
+    abort: AbortController,
+  ): Promise<void> {
+    while (queue.length > 0) {
+      if (abort.signal.aborted) return;
+      const path = queue.shift();
+      if (path === undefined) return;
+      const bytes = await dirSize(path, { signal: abort.signal }).catch(
+        () => 0,
+      );
+      // A newer batch (navigation, or a rescan of this same directory) may
+      // have superseded this one while the walk was in flight.
+      if (abort.signal.aborted) return;
+      this.dirSizeCache.set(path, bytes);
+      this.notify();
+    }
   }
 
   // ── paste (Phase 5a copy, Phase 5b cut) ──

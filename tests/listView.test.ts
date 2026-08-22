@@ -142,6 +142,91 @@ describe("header/data column alignment", () => {
   });
 });
 
+describe("Size column: directories", () => {
+  // `entry.size` for a directory is just the raw inode size, not a
+  // recursive total (see fsapi/entry.ts) — the real total, when there is
+  // one, comes from the `dirSizes` map `Store.dirSizes()` fills in (see
+  // state/store.ts's `scheduleDirSizeScan`).
+  function sizeField(
+    screen: Screen,
+    layout: ReturnType<typeof computeListLayout>,
+  ): string {
+    const colX = layout.colStarts.size;
+    if (colX === undefined) throw new Error("no size column in this layout");
+    return (screen.renderPlainText().split("\n")[0] ?? "").slice(
+      colX,
+      colX + COLUMN_WIDTH.size,
+    );
+  }
+
+  it("shows '-' for a directory with no cached total yet", () => {
+    const width = 100;
+    const layout = computeListLayout(width);
+    const screen = new Screen(width, 1, () => {});
+    const entries = [makeEntry("some-dir", { kind: "dir" })];
+
+    renderListView(screen, 0, 0, width, 1, entries, 0, 0, layout, "ascii");
+
+    expect(sizeField(screen, layout).trim()).toBe("-");
+  });
+
+  it("shows the cached recursive total once the directory's walk resolves", () => {
+    const width = 100;
+    const layout = computeListLayout(width);
+    const screen = new Screen(width, 1, () => {});
+    const entry = makeEntry("some-dir", { kind: "dir" });
+    const dirSizes = new Map([[entry.path, 1536]]);
+
+    renderListView(
+      screen,
+      0,
+      0,
+      width,
+      1,
+      [entry],
+      0,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      dirSizes,
+    );
+
+    expect(sizeField(screen, layout).trim()).toBe("1.5K");
+  });
+
+  it("shows a file's own byte count, never consulting dirSizes", () => {
+    const width = 100;
+    const layout = computeListLayout(width);
+    const screen = new Screen(width, 1, () => {});
+    const entry = makeEntry("a-file.txt", { size: 42 });
+    // Keyed by the same path a directory entry would use — must be ignored
+    // since this entry isn't a directory.
+    const dirSizes = new Map([[entry.path, 999_999]]);
+
+    renderListView(
+      screen,
+      0,
+      0,
+      width,
+      1,
+      [entry],
+      0,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      dirSizes,
+    );
+
+    expect(sizeField(screen, layout).trim()).toBe("42");
+  });
+});
+
 // ── Phase 4: selection & clipboard status rendering ──
 //
 // The status column sits at screen column 1 (right after the cursor marker

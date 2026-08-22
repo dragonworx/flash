@@ -7,6 +7,7 @@ import {
   formatBreadcrumb,
   formatItemCount,
   formatStatusLeft,
+  formatStatusRight,
   pathSegments,
 } from "../src/ui/chrome.ts";
 
@@ -99,5 +100,17 @@ describe("formatStatusLeft (Phase 4: mark count + clipboard state)", () => {
     expect(formatStatusLeft({ itemCount: 12, clipboard: null })).toBe(
       "12 items",
     );
+  });
+});
+
+describe("formatStatusRight", () => {
+  it("is empty when nothing is selected", () => {
+    expect(formatStatusRight(0)).toBe("");
+  });
+
+  it("formats the byte total with a trailing space", () => {
+    expect(formatStatusRight(3)).toBe("3 b ");
+    expect(formatStatusRight(1536)).toBe("1.5 Kb ");
+    expect(formatStatusRight(340 * 1024 * 1024)).toBe("340 Mb ");
   });
 });

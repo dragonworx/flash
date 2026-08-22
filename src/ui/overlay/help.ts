@@ -175,8 +175,17 @@ export function renderHelpOverlay(
   const box = computeHelpBox(screenWidth, screenHeight);
   if (box.width < 4 || box.height < 4) return;
 
-  const borderStyle: Style = { fg: colors.chrome };
+  // A solid backdrop, not just a border: every `put()` below sets this same
+  // `bg` too, since `Screen.put` replaces a cell's style wholesale (an
+  // omitted `bg` means "terminal default", not "whatever was already
+  // there") — without it the file list underneath would show through
+  // wherever a line's text is shorter than the box is wide.
+  const bg = colors.footerBg;
+  const borderStyle: Style = { fg: colors.chrome, bg };
   screen.box(box.x, box.y, box.width, box.height, borderStyle);
+  for (let y = box.y + 1; y < box.y + box.height - 1; y++) {
+    screen.put(box.x + 1, y, " ".repeat(box.width - 2), { bg });
+  }
 
   const innerX = box.x + 2;
   const innerWidth = Math.max(box.width - 4, 0);
@@ -190,6 +199,7 @@ export function renderHelpOverlay(
   screen.put(innerX, titleY, truncate("Keyboard shortcuts", innerWidth), {
     fg: colors.titleEmphasis,
     attr: ATTR_BOLD,
+    bg,
   });
 
   const maxOffset = Math.max(0, HELP_LINES.length - viewportHeight);
@@ -208,15 +218,18 @@ export function renderHelpOverlay(
       screen.put(innerX, y, truncate(line.text, innerWidth), {
         fg: colors.header,
         attr: ATTR_BOLD,
+        bg,
       });
     } else {
       screen.put(innerX, y, pad(line.keys, keyColWidth), {
         fg: colors.accent,
         attr: ATTR_BOLD,
+        bg,
       });
       if (descWidth > 0) {
         screen.put(descX, y, truncate(line.description, descWidth), {
           fg: colors.titleEmphasis,
+          bg,
         });
       }
     }
@@ -227,6 +240,6 @@ export function renderHelpOverlay(
       HELP_LINES.length > viewportHeight
         ? "↑/↓ or j/k scrolls, PgUp/PgDn pages · Esc or ? closes"
         : "Esc or ? closes";
-    screen.put(innerX, footerY, pad(hint, innerWidth), { fg: colors.dim });
+    screen.put(innerX, footerY, pad(hint, innerWidth), { fg: colors.dim, bg });
   }
 }

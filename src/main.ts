@@ -65,6 +65,10 @@ import {
 import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
 import { maxHelpScroll, renderHelpOverlay } from "./ui/overlay/help.ts";
 import { renderPermissionsOverlay } from "./ui/overlay/permissions.ts";
+import {
+  maxPreviewScroll,
+  renderPreviewOverlay,
+} from "./ui/overlay/preview.ts";
 import { renderProgressOverlay } from "./ui/overlay/progress.ts";
 import { renderPromptOverlay } from "./ui/overlay/prompt.ts";
 
@@ -362,6 +366,8 @@ function draw(screen: Screen): void {
         iconSet,
         after.marked,
         after.clipboard,
+        Date.now(),
+        store.dirSizes(),
       );
     }
   }
@@ -373,6 +379,7 @@ function draw(screen: Screen): void {
       markedCount: state.marked.size,
       clipboard: state.clipboard,
       message: state.message,
+      selectedSize: store.selectedSize(),
     });
   }
 
@@ -411,6 +418,8 @@ function draw(screen: Screen): void {
     });
   } else if (state.overlay?.kind === "help") {
     renderHelpOverlay(screen, w, h, state.overlay.scrollOffset);
+  } else if (state.overlay?.kind === "preview") {
+    renderPreviewOverlay(screen, w, h, state.overlay);
   }
 
   screen.flush();
@@ -657,6 +666,19 @@ input.onKey((key: Key) => {
         maxHelpScroll(Math.max(screen.columns, 1), Math.max(screen.rows, 1)),
       );
       break;
+    case "previewScroll": {
+      const overlay = store.getState().overlay;
+      const lineCount = overlay?.kind === "preview" ? overlay.lines.length : 0;
+      store.previewScroll(
+        action.delta,
+        maxPreviewScroll(
+          Math.max(screen.columns, 1),
+          Math.max(screen.rows, 1),
+          lineCount,
+        ),
+      );
+      break;
+    }
     case "quit":
       quit();
       break;
@@ -694,6 +716,7 @@ input.onKey((key: Key) => {
       else if (overlay?.kind === "confirm") store.cancelDelete();
       else if (overlay?.kind === "permissions") store.cancelPermissions();
       else if (overlay?.kind === "help") store.closeHelp();
+      else if (overlay?.kind === "preview") store.cancelPreview();
       break;
     }
     case "startRename":

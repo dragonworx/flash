@@ -59,6 +59,101 @@ describe("Store.load", () => {
   });
 });
 
+describe("Store.selectedSize", () => {
+  it("falls back to the entry under the cursor when nothing is marked", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(idx);
+    expect(store.selectedSize()).toBe(3); // "top"
+  });
+
+  it("is 0 for a directory right away, then fills in with its recursive total", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "alpha");
+    store.setCursorIndex(idx);
+    // `entry.size` there is the raw inode size, not a total — the real
+    // total comes from `load()`'s background batch walk over the whole
+    // listing (see `Store.scheduleDirSizeScan`), so it isn't available on
+    // the same tick.
+    expect(store.selectedSize()).toBe(0);
+    await Bun.sleep(300);
+    expect(store.selectedSize()).toBe(4); // alpha/leaf.txt, contents "leaf"
+  });
+
+  it("sums marked files immediately and marked directories once their walk resolves", async () => {
+    const store = await makeLoadedStore();
+    const list = store.visibleEntries();
+    for (const name of ["alpha", "top.txt"]) {
+      store.setCursorIndex(list.findIndex((e) => e.name === name));
+      store.toggleMarkAtCursor();
+    }
+    expect(store.selectedSize()).toBe(3); // "top" only — alpha not resolved yet
+    await Bun.sleep(300);
+    expect(store.selectedSize()).toBe(7); // "top" (3) + alpha/leaf.txt (4)
+  });
+
+  it("is 0 when the cursor is on the synthetic '..' row and nothing is marked", async () => {
+    const store = await makeLoadedStore();
+    store.moveCursorTo("home");
+    expect(store.selectedSize()).toBe(0);
+  });
+
+  it("reflects a selection change immediately once the batch scan has already resolved", async () => {
+    const store = await makeLoadedStore();
+    const list = store.visibleEntries();
+    store.setCursorIndex(list.findIndex((e) => e.name === "alpha"));
+    await Bun.sleep(300); // let the whole-listing batch scan resolve
+    store.setCursorIndex(list.findIndex((e) => e.name === "top.txt"));
+    // No further delay needed — alpha's cached total simply isn't part of
+    // this selection.
+    expect(store.selectedSize()).toBe(3);
+  });
+});
+
+describe("Store.dirSizes", () => {
+  it("fills in every directory in the listing, not just the selection", async () => {
+    const store = await makeLoadedStore();
+    await Bun.sleep(300);
+    const list = store.visibleEntries();
+    const alphaPath = list.find((e) => e.name === "alpha")?.path ?? "";
+    const betaPath = list.find((e) => e.name === "beta")?.path ?? "";
+    expect(store.dirSizes().get(alphaPath)).toBe(4); // alpha/leaf.txt
+    expect(store.dirSizes().get(betaPath)).toBe(0); // beta is empty
+  });
+
+  it("reuses a cached total when the same directory is revisited, with no further delay", async () => {
+    const store = await makeLoadedStore();
+    await Bun.sleep(300);
+    const alphaPath =
+      store.visibleEntries().find((e) => e.name === "alpha")?.path ?? "";
+    expect(store.dirSizes().get(alphaPath)).toBe(4);
+
+    await store.load(join(root, "alpha"));
+    await store.load(root);
+    expect(store.dirSizes().get(alphaPath)).toBe(4);
+  });
+
+  it("drops a rescanned directory's own cached total so it's recomputed", async () => {
+    const scanRoot = mkdtempSync(join(tmpdir(), "flash-store-dirsize-test-"));
+    mkdirSync(join(scanRoot, "sub"));
+    writeFileSync(join(scanRoot, "sub", "a.txt"), "a"); // 1 byte
+    try {
+      const store = await makeLoadedStore(scanRoot);
+      await Bun.sleep(300);
+      const subPath =
+        store.visibleEntries().find((e) => e.name === "sub")?.path ?? "";
+      expect(store.dirSizes().get(subPath)).toBe(1);
+
+      writeFileSync(join(scanRoot, "sub", "b.txt"), "bb"); // +2 bytes
+      await store.refresh(scanRoot);
+      await Bun.sleep(300);
+      expect(store.dirSizes().get(subPath)).toBe(3);
+    } finally {
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Store navigation", () => {
   it("enter() descends into the directory under the cursor", async () => {
     const store = await makeLoadedStore();
@@ -616,6 +711,97 @@ describe("Store.refresh", () => {
       expect(current?.name).toBe("child");
     } finally {
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("Store: text preview (Enter on a plain file)", () => {
+  it("Enter on a regular file opens the preview overlay with its contents", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(idx);
+    await store.enter();
+    const overlay = store.getState().overlay;
+    expect(overlay?.kind).toBe("preview");
+    if (overlay?.kind === "preview") {
+      expect(overlay.path).toBe(join(root, "top.txt"));
+      expect(overlay.loading).toBe(false);
+      expect(overlay.error).toBeNull();
+      expect(
+        overlay.lines
+          .flat()
+          .map((s) => s.text)
+          .join(""),
+      ).toContain("top");
+    }
+  });
+
+  it("Enter on a directory still navigates instead of previewing", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "alpha");
+    store.setCursorIndex(idx);
+    await store.enter();
+    expect(store.getState().overlay).toBeNull();
+    expect(store.getState().cwd).toBe(join(root, "alpha"));
+  });
+
+  it("does not stack a preview on top of an already-open overlay", async () => {
+    const store = await makeLoadedStore();
+    store.startMkdir();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(idx);
+    await store.enter();
+    expect(store.getState().overlay?.kind).toBe("prompt"); // unchanged
+  });
+
+  it("previewScroll clamps within [0, maxScrollOffset] and is a no-op off the preview overlay", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(idx);
+    await store.enter();
+
+    store.previewScroll(-5, 10);
+    expect(
+      store.getState().overlay?.kind === "preview"
+        ? store.getState().overlay
+        : null,
+    ).not.toBeNull();
+    const overlay1 = store.getState().overlay;
+    if (overlay1?.kind === "preview") expect(overlay1.scrollOffset).toBe(0);
+
+    store.previewScroll(100, 10);
+    const overlay2 = store.getState().overlay;
+    if (overlay2?.kind === "preview") expect(overlay2.scrollOffset).toBe(10);
+
+    store.cancelPreview();
+    // No overlay open now — previewScroll must not throw or reopen one.
+    expect(() => store.previewScroll(1, 10)).not.toThrow();
+    expect(store.getState().overlay).toBeNull();
+  });
+
+  it("cancelPreview closes the overlay", async () => {
+    const store = await makeLoadedStore();
+    const idx = store.visibleEntries().findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(idx);
+    await store.enter();
+    expect(store.getState().overlay?.kind).toBe("preview");
+    store.cancelPreview();
+    expect(store.getState().overlay).toBeNull();
+  });
+
+  it("a broken symlink stays inert instead of opening a preview", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "flash-store-preview-test-"));
+    try {
+      const { symlinkSync } = await import("node:fs");
+      symlinkSync("does-not-exist", join(dir, "broken"));
+      const store = new Store({ cwd: dir, showHidden: true });
+      await store.load(dir);
+      const idx = store.visibleEntries().findIndex((e) => e.name === "broken");
+      store.setCursorIndex(idx);
+      await store.enter();
+      expect(store.getState().overlay).toBeNull();
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
     }
   });
 });

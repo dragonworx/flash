@@ -1,12 +1,20 @@
 # flash
 
-A full-screen, keyboard-driven terminal file manager. `flash` renders a
-directory as a list or a grid — icons, sizes, permissions, owner/group,
-modified time — lets you navigate, multi-select, copy/cut/paste with
-conflict resolution and progress, rename, mkdir, delete, edit permissions,
-and browse zip archives as if they were folders, all with live updates when
-files change underneath it. No mouse support, on purpose: your terminal's
-own click-drag text selection keeps working inside a `flash` pane.
+**Terminal file management, reimagined for speed.**
+
+Most file managers make you wait — for a mouse to move, for a window to
+redraw, for a spinner to finish. `flash` doesn't. It's a full-screen,
+keyboard-driven terminal file manager built to react the instant you press a
+key: navigate, multi-select, copy/cut/paste with conflict resolution and a
+live progress bar, rename, mkdir, delete, edit permissions, and browse zip
+archives as if they were folders — all rendered as a list or a grid with
+icons, sizes, permissions, owner/group, and modified time, and all kept live
+as files change underneath it. No mouse support, on purpose: your terminal's
+own click-drag text selection keeps working inside a `flash` pane. Point it
+at a directory and move at the speed of thought.
+
+Below is a quick tour — install it in under a minute, then skim the
+keybindings so nothing surprises you once you're in.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
@@ -40,6 +48,7 @@ every frame in synchronized-output escapes so a multiplexer never tears mid-repa
 **Clone and run** (needs [Bun](https://bun.sh) ≥ 1.3):
 
 ```sh
+curl -fsSL https://bun.sh/install | bash   # skip this if `bun --version` already prints ≥ 1.3
 git clone <repo-url> flash && cd flash
 bun install
 bun run start                # or: bun run src/main.ts -d ~/some/directory

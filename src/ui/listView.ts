@@ -109,6 +109,9 @@ const MIN_NAME_WIDTH = 24;
 // Shared, never mutated — just the default for callers (existing tests,
 // mostly) that don't care about marks, so they don't need to pass one.
 const EMPTY_MARKED: ReadonlySet<string> = new Set();
+// Same reasoning, for callers that don't care about folder sizes — see
+// `sizeText` below.
+const EMPTY_DIR_SIZES: ReadonlyMap<string, number> = new Map();
 
 function fixedCost(columns: ColumnKey[]): number {
   return (
@@ -160,21 +163,39 @@ export function computeListLayout(width: number): ListLayout {
 
 // ── cell text ──
 
-function sizeText(entry: Entry): string {
+/**
+ * `entry.size` for a directory is just the raw inode size, not a total (see
+ * fsapi/entry.ts), so a real total comes from `dirSizes` instead — the
+ * per-path cache `Store` fills in asynchronously (`Store.dirSizes()`,
+ * backed by the same `fsapi/ops/index.ts` `dirSize()` walk `selectedSize()`
+ * uses). A path not yet in the cache — still being walked, the synthetic
+ * ".." row (never queued), or an archive-internal entry (the batch walk
+ * only ever queues real filesystem paths) — reads the same "-" a directory
+ * always showed before this existed, so there's no separate "pending" glyph
+ * to keep in sync with the real one.
+ */
+function sizeText(entry: Entry, dirSizes: ReadonlyMap<string, number>): string {
   if (entry.error) return "err";
   if (entry.kind === "symlink" && entry.broken) return "brkn";
   if (
     entry.kind === "dir" ||
     (entry.kind === "symlink" && entry.targetKind === "dir")
-  )
-    return "-";
+  ) {
+    const bytes = dirSizes.get(entry.path);
+    return bytes === undefined ? "-" : formatSize(bytes);
+  }
   return formatSize(entry.size);
 }
 
-function columnText(col: ColumnKey, entry: Entry, now: number): string {
+function columnText(
+  col: ColumnKey,
+  entry: Entry,
+  now: number,
+  dirSizes: ReadonlyMap<string, number>,
+): string {
   switch (col) {
     case "size":
-      return sizeText(entry);
+      return sizeText(entry, dirSizes);
     case "mode":
       return formatMode(entry.mode);
     case "owner":
@@ -227,6 +248,7 @@ function renderRow(
   now: number,
   marked: ReadonlySet<string>,
   clipboard: ClipboardLike,
+  dirSizes: ReadonlyMap<string, number>,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -288,7 +310,7 @@ function renderRow(
     screen.put(
       x + colX,
       y,
-      pad(columnText(col, entry, now), COLUMN_WIDTH[col], "right"),
+      pad(columnText(col, entry, now, dirSizes), COLUMN_WIDTH[col], "right"),
       { ...rowStyle, fg: isCursor ? undefined : colors.dim, attr: contentAttr },
     );
   }
@@ -316,6 +338,7 @@ export function renderListView(
   marked: ReadonlySet<string> = EMPTY_MARKED,
   clipboard: ClipboardLike = null,
   now: number = Date.now(),
+  dirSizes: ReadonlyMap<string, number> = EMPTY_DIR_SIZES,
 ): void {
   if (width <= 0 || height <= 0) return;
   for (let row = 0; row < height; row++) {
@@ -334,6 +357,7 @@ export function renderListView(
       now,
       marked,
       clipboard,
+      dirSizes,
     );
   }
 }

@@ -62,6 +62,12 @@ export type Action =
   // is a line count, with Home/End sending an oversized delta that
   // `Store.helpScroll`'s clamp reduces to "jump to the very top/bottom."
   | { type: "helpScroll"; delta: number }
+  // The text preview overlay (Enter on a plain file — see
+  // state/store.ts's `startPreview`). `previewScroll` only ever fires
+  // while `state.overlay?.kind === "preview"` (see `resolvePreviewKey`
+  // below), same shape as `helpScroll` above including the Home/End
+  // oversized-delta convention.
+  | { type: "previewScroll"; delta: number }
   // Phase 4: selection and clipboard. `toggleMark` also advances the
   // cursor (see state/store.ts's `MARK_ADVANCE`); `extendSelection` carries
   // the arrow direction so the Shift+↑/↓ range anchor extends the right way.
@@ -258,7 +264,7 @@ export const BINDINGS: KeyBinding[] = [
   },
   {
     display: ["Enter", "Space", "l"],
-    description: "Open the selected entry (enter dir / view file)",
+    description: "Open the selected entry (enter dir / preview file)",
     category: "navigation",
     matches: bare("enter", "space", "l"),
     action: () => ({ type: "enter" }),
@@ -598,6 +604,70 @@ function resolveHelpKey(key: Key): Action | null {
   }
 }
 
+// Same fixed-size "page" PgUp/PgDn already used before vim bindings existed
+// here — not the box's real viewport height (unlike Home/End's jump, which
+// deliberately overshoots to whatever the true bottom is; see
+// `HELP_SCROLL_JUMP`). Ctrl+F/Ctrl+B (vim/less "full page") reuse it as-is;
+// Ctrl+D/Ctrl+U (vim/less "half page") reuse half of it.
+const PREVIEW_PAGE_LINES = 10;
+
+/**
+ * The text preview overlay captures every key except Escape (handled
+ * unconditionally before this ever runs, same as every other overlay) —
+ * only scroll keys mean anything here, everything else is swallowed rather
+ * than leaking through to the browser behind it. There's no toggle-closed
+ * key of its own (unlike help's `?`) since there's no single dedicated key
+ * that opens a preview — Enter's behavior depends on what's under the
+ * cursor — so Escape is the only way out, per the feature's own spec.
+ *
+ * The scroll keys are deliberately vim/less's own set — `j`/`k`, `g`/`G`
+ * (jump to top/bottom, aliasing Home/End's oversized-delta trick), and
+ * Ctrl+D/Ctrl+U/Ctrl+F/Ctrl+B (half/full page) — since this overlay only
+ * ever captures raw stdin bytes and renders through `Screen` like the rest
+ * of the app (see CLAUDE.md's "nothing outside `Screen` ever writes to
+ * stdout" invariant); it does not hand the terminal to a real interactive
+ * `bat`/`less` pager, so replicating that pager's own keybindings here is
+ * the only way to get its muscle-memory shortcuts without breaking that
+ * invariant.
+ */
+function resolvePreviewKey(key: Key): Action | null {
+  if (key.alt) return null;
+  if (key.ctrl) {
+    switch (key.name) {
+      case "d":
+        return { type: "previewScroll", delta: PREVIEW_PAGE_LINES / 2 };
+      case "u":
+        return { type: "previewScroll", delta: -PREVIEW_PAGE_LINES / 2 };
+      case "f":
+        return { type: "previewScroll", delta: PREVIEW_PAGE_LINES };
+      case "b":
+        return { type: "previewScroll", delta: -PREVIEW_PAGE_LINES };
+      default:
+        return null;
+    }
+  }
+  switch (key.name) {
+    case "up":
+    case "k":
+      return { type: "previewScroll", delta: -1 };
+    case "down":
+    case "j":
+      return { type: "previewScroll", delta: 1 };
+    case "pageup":
+      return { type: "previewScroll", delta: -PREVIEW_PAGE_LINES };
+    case "pagedown":
+      return { type: "previewScroll", delta: PREVIEW_PAGE_LINES };
+    case "home":
+    case "g":
+      return { type: "previewScroll", delta: -HELP_SCROLL_JUMP };
+    case "end":
+    case "G":
+      return { type: "previewScroll", delta: HELP_SCROLL_JUMP };
+    default:
+      return null;
+  }
+}
+
 // ── the rest of the bindings: driven entirely by `BINDINGS` above ──
 
 /**
@@ -613,6 +683,7 @@ export function resolveAction(key: Key, state: AppState): Action | null {
   if (state.overlay?.kind === "confirm") return resolveConfirmKey(key);
   if (state.overlay?.kind === "permissions") return resolvePermissionsKey(key);
   if (state.overlay?.kind === "help") return resolveHelpKey(key);
+  if (state.overlay?.kind === "preview") return resolvePreviewKey(key);
   for (const binding of BINDINGS) {
     if (binding.matches(key)) return binding.action(key);
   }

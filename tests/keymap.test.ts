@@ -356,3 +356,99 @@ describe("resolveAction: permissions overlay", () => {
     expect(resolveAction(makeKey({ name: "q" }), permState)).toBeNull();
   });
 });
+
+describe("resolveAction: preview overlay captures input", () => {
+  const previewState = makeState({
+    overlay: {
+      kind: "preview",
+      path: "/tmp/somewhere/file.txt",
+      lines: [],
+      scrollOffset: 0,
+      loading: false,
+      error: null,
+      truncated: false,
+    },
+  });
+
+  it("scroll keys map to previewScroll", () => {
+    expect(resolveAction(makeKey({ name: "down" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: 1,
+    });
+    expect(resolveAction(makeKey({ name: "j" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: 1,
+    });
+    expect(resolveAction(makeKey({ name: "up" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: -1,
+    });
+    expect(resolveAction(makeKey({ name: "k" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: -1,
+    });
+    expect(resolveAction(makeKey({ name: "pagedown" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: 10,
+    });
+    expect(resolveAction(makeKey({ name: "pageup" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: -10,
+    });
+    expect(resolveAction(makeKey({ name: "end" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: 1_000_000,
+    });
+    expect(resolveAction(makeKey({ name: "home" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: -1_000_000,
+    });
+  });
+
+  it("g/G alias Home/End, matching less/bat's own jump-to-top/bottom", () => {
+    expect(resolveAction(makeKey({ name: "g" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: -1_000_000,
+    });
+    expect(resolveAction(makeKey({ name: "G" }), previewState)).toEqual({
+      type: "previewScroll",
+      delta: 1_000_000,
+    });
+  });
+
+  it("Ctrl+D/U/F/B map to vim/less's half/full-page scroll", () => {
+    expect(
+      resolveAction(makeKey({ name: "f", ctrl: true }), previewState),
+    ).toEqual({ type: "previewScroll", delta: 10 });
+    expect(
+      resolveAction(makeKey({ name: "b", ctrl: true }), previewState),
+    ).toEqual({ type: "previewScroll", delta: -10 });
+    expect(
+      resolveAction(makeKey({ name: "d", ctrl: true }), previewState),
+    ).toEqual({ type: "previewScroll", delta: 5 });
+    expect(
+      resolveAction(makeKey({ name: "u", ctrl: true }), previewState),
+    ).toEqual({ type: "previewScroll", delta: -5 });
+  });
+
+  it("other Ctrl combos are swallowed, not leaked through", () => {
+    expect(
+      resolveAction(makeKey({ name: "c", ctrl: true }), previewState),
+    ).toBeNull();
+  });
+
+  it("swallows keys that would copy/cut/quit/rename in the plain browser", () => {
+    expect(resolveAction(makeKey({ name: "c" }), previewState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "x" }), previewState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "q" }), previewState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "r" }), previewState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "enter" }), previewState)).toBeNull();
+  });
+
+  it("Escape closes it via the ordinary precedence table (arm 1)", () => {
+    expect(resolveEscape(previewState)).toEqual({ type: "closeOverlay" });
+    expect(resolveAction(makeKey({ name: "escape" }), previewState)).toEqual({
+      type: "closeOverlay",
+    });
+  });
+});
