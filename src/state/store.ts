@@ -817,11 +817,23 @@ export class Store {
     this.notify();
   }
 
-  /** Clear every mark — Escape's second-precedence arm when marks exist. */
+  /**
+   * Clear every mark and cancel a staged cut — Escape's second-precedence
+   * arm when marks exist or a cut is pending. A staged *copy* is left
+   * alone: it's non-destructive and meant to survive navigation to
+   * wherever the user pastes it. See keymap.ts's `ESCAPE_PRECEDENCE`
+   * comment for why a cut needs the same treatment as marks — `rowMarkState`
+   * checks the clipboard before `marked`, so a cut with no prior mark (the
+   * cursor-only fallback) would otherwise keep showing its "x" glyph after
+   * marks are cleared.
+   */
   clearMarks(): void {
-    if (this.state.marked.size === 0) return;
+    const hadMarks = this.state.marked.size > 0;
+    const hadCut = this.state.clipboard?.mode === "cut";
+    if (!hadMarks && !hadCut) return;
     this.state.marked.clear();
     this.resetRangeAnchor();
+    if (hadCut) this.state.clipboard = null;
     this.notify();
   }
 

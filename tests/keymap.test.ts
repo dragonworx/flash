@@ -115,6 +115,22 @@ describe("resolveEscape precedence", () => {
     expect(resolveEscape(state)).toEqual({ type: "up" });
   });
 
+  it("clears (cancels) a staged cut even with no marks (arm 2)", () => {
+    const state = makeState({
+      marked: new Set(),
+      clipboard: { mode: "cut", paths: ["/tmp/somewhere/a.txt"] },
+    });
+    expect(resolveEscape(state)).toEqual({ type: "clearMarks" });
+  });
+
+  it("leaves a staged copy alone and goes up (arm 4) — copy isn't destructive", () => {
+    const state = makeState({
+      marked: new Set(),
+      clipboard: { mode: "copy", paths: ["/tmp/somewhere/a.txt"] },
+    });
+    expect(resolveEscape(state)).toEqual({ type: "up" });
+  });
+
   it("resolveAction('escape') routes through the same precedence table", () => {
     const state = makeState({ marked: new Set(["/tmp/somewhere/a.txt"]) });
     const action = resolveAction(makeKey({ name: "escape" }), state);

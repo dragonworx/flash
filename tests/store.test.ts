@@ -310,6 +310,25 @@ describe("Store.clearMarks", () => {
     store.clearMarks();
     expect(store.getState().marked.size).toBe(0);
   });
+
+  it("cancels a staged cut, even one staged via the cursor with no marks", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f5.txt"));
+    store.cut();
+    expect(store.getState().clipboard?.mode).toBe("cut");
+    store.clearMarks();
+    expect(store.getState().clipboard).toBeNull();
+  });
+
+  it("leaves a staged copy alone", async () => {
+    const store = await makeSelStore();
+    store.markAll();
+    store.copy();
+    expect(store.getState().clipboard?.mode).toBe("copy");
+    store.clearMarks();
+    expect(store.getState().marked.size).toBe(0);
+    expect(store.getState().clipboard?.mode).toBe("copy");
+  });
 });
 
 describe("Store.pruneMarks", () => {

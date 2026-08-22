@@ -9,9 +9,16 @@
 // Escape has three jobs per the plan, resolved in strict precedence order,
 // first match wins:
 //   1. An overlay is open -> close it.
-//   2. Marks exist -> clear them.
+//   2. Marks exist, or a cut is staged -> clear marks and cancel the cut.
 //   3. Browsing an archive at its root -> leave the archive.
 //   4. Otherwise -> go up one directory.
+// Arm 2 only cancels a *cut* clipboard, not a *copy* one — a staged copy is
+// non-destructive and expected to survive navigation to wherever you mean to
+// paste it (h/Backspace/← still go up regardless of Escape's state, so nothing
+// is stranded). A staged cut gets the same "deselect" treatment as marks
+// because `rowMarkState` (term/theme.ts) checks the clipboard before `marked`
+// — clearing only `marked` would leave a lone cut entry (no prior mark, e.g.
+// cut via the cursor with nothing selected) showing its "x" glyph forever.
 // All four arms are reachable as of Phase 8: Phase 5a's progress overlay and
 // Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
 // marks have been real since Phase 4; arm 3 (`isArchiveRoot`, below) is real
@@ -419,7 +426,7 @@ export const ESCAPE_HELP: {
   category: BindingCategory;
 } = {
   display: ["Esc"],
-  description: "Close overlay > clear marks > leave archive > go up",
+  description: "Close overlay > clear marks/cut > leave archive > go up",
   category: "navigation",
 };
 
@@ -433,7 +440,10 @@ function isArchiveRoot(state: AppState): boolean {
 
 const ESCAPE_PRECEDENCE: EscapeGuard[] = [
   (s) => (s.overlay ? { type: "closeOverlay" } : null),
-  (s) => (s.marked.size > 0 ? { type: "clearMarks" } : null),
+  (s) =>
+    s.marked.size > 0 || s.clipboard?.mode === "cut"
+      ? { type: "clearMarks" }
+      : null,
   (s) => (isArchiveRoot(s) ? { type: "leaveArchive" } : null),
   () => ({ type: "up" }),
 ];
