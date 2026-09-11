@@ -28,6 +28,7 @@ function makeState(overrides: Partial<AppState> = {}): AppState {
     overlay: null,
     message: null,
     archive: null,
+    filter: null,
     ...overrides,
   };
 }
@@ -155,6 +156,22 @@ describe("resolveEscape precedence", () => {
     const state = makeState({ marked: new Set(["/tmp/somewhere/a.txt"]) });
     const action = resolveAction(makeKey({ name: "escape" }), state);
     expect(action).toEqual({ type: "clearMarks" });
+  });
+
+  it("closes the filter ahead of clearing marks (arm 2, new)", () => {
+    const state = makeState({
+      filter: { query: "ab" },
+      marked: new Set(["/tmp/somewhere/a.txt"]),
+    });
+    expect(resolveEscape(state)).toEqual({ type: "closeFilter" });
+  });
+
+  it("falls through to clearing marks once the filter is closed", () => {
+    const state = makeState({
+      filter: null,
+      marked: new Set(["/tmp/somewhere/a.txt"]),
+    });
+    expect(resolveEscape(state)).toEqual({ type: "clearMarks" });
   });
 });
 
@@ -478,6 +495,121 @@ describe("resolveAction: goto bookmark ('b')", () => {
     expect(resolveAction(makeKey({ name: "b" }), makeState())).toEqual({
       type: "startBookmarks",
     });
+  });
+});
+
+describe("resolveAction: '/' opens the quick filter", () => {
+  it("/ opens the filter in the plain browser", () => {
+    expect(resolveAction(makeKey({ name: "/" }), makeState())).toEqual({
+      type: "startFilter",
+    });
+  });
+});
+
+describe("resolveAction: quick filter captures input", () => {
+  const filterState = makeState({ filter: { query: "ab" } });
+
+  it("types a letter that would otherwise be a global file-op shortcut (e.g. 'c', 'd')", () => {
+    expect(resolveAction(makeKey({ name: "c" }), filterState)).toEqual({
+      type: "filterChar",
+      ch: "c",
+    });
+    expect(resolveAction(makeKey({ name: "d" }), filterState)).toEqual({
+      type: "filterChar",
+      ch: "d",
+    });
+  });
+
+  it("types the '/' that opened it, since a second '/' is just query text", () => {
+    expect(resolveAction(makeKey({ name: "/" }), filterState)).toEqual({
+      type: "filterChar",
+      ch: "/",
+    });
+  });
+
+  it("types a wide/CJK character verbatim", () => {
+    expect(resolveAction(makeKey({ name: "文" }), filterState)).toEqual({
+      type: "filterChar",
+      ch: "文",
+    });
+  });
+
+  it("Backspace edits the query instead of navigating up", () => {
+    expect(resolveAction(makeKey({ name: "backspace" }), filterState)).toEqual({
+      type: "filterBackspace",
+    });
+  });
+
+  it("Space types a space", () => {
+    expect(resolveAction(makeKey({ name: "space" }), filterState)).toEqual({
+      type: "filterChar",
+      ch: " ",
+    });
+  });
+
+  it("Up/Down navigate the filtered list rather than typing", () => {
+    expect(resolveAction(makeKey({ name: "up" }), filterState)).toEqual({
+      type: "navigate",
+      dir: "up",
+    });
+    expect(resolveAction(makeKey({ name: "down" }), filterState)).toEqual({
+      type: "navigate",
+      dir: "down",
+    });
+  });
+
+  it("PgUp/PgDn/Home/End still page and jump", () => {
+    expect(resolveAction(makeKey({ name: "pageup" }), filterState)).toEqual({
+      type: "pageMove",
+      direction: "up",
+    });
+    expect(resolveAction(makeKey({ name: "pagedown" }), filterState)).toEqual({
+      type: "pageMove",
+      direction: "down",
+    });
+    expect(resolveAction(makeKey({ name: "home" }), filterState)).toEqual({
+      type: "moveCursorTo",
+      pos: "home",
+    });
+    expect(resolveAction(makeKey({ name: "end" }), filterState)).toEqual({
+      type: "moveCursorTo",
+      pos: "end",
+    });
+  });
+
+  it("Tab still toggles the mark at the cursor", () => {
+    expect(resolveAction(makeKey({ name: "tab" }), filterState)).toEqual({
+      type: "toggleMark",
+    });
+  });
+
+  it("Enter opens the entry under the cursor", () => {
+    expect(resolveAction(makeKey({ name: "enter" }), filterState)).toEqual({
+      type: "enter",
+    });
+  });
+
+  it("swallows an arrow-key-adjacent function key and Left/Right rather than typing them", () => {
+    expect(resolveAction(makeKey({ name: "f5" }), filterState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "left" }), filterState)).toBeNull();
+    expect(resolveAction(makeKey({ name: "right" }), filterState)).toBeNull();
+  });
+
+  it("other ctrl/alt combinations are swallowed, not typed", () => {
+    expect(
+      resolveAction(makeKey({ name: "c", ctrl: true }), filterState),
+    ).toBeNull();
+  });
+
+  it("Escape closes the filter via the ordinary Escape precedence, ahead of clearing marks", () => {
+    const marked = makeState({
+      filter: { query: "ab" },
+      marked: new Set(["/tmp/somewhere/a.txt"]),
+    });
+    expect(resolveAction(makeKey({ name: "escape" }), marked)).toEqual({
+      type: "closeFilter",
+    });
+    expect(resolveEscape(marked)).toEqual({ type: "closeFilter" });
   });
 });
 

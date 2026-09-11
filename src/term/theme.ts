@@ -60,6 +60,12 @@ export const colors = {
   // clean repo, orange for a dirty one.
   gitClean: 0x8ce99a,
   gitDirty: 0xffa94d,
+  // The `/` quick filter's matched-substring highlight (see
+  // `filterMatchSpan` below) — a background color, not a foreground one,
+  // so it reads as "this is the part that matched" without fighting the
+  // row's own file-type foreground color (dir blue, executable green,
+  // ...), which stays exactly as it was everywhere else on the row.
+  matchHighlight: 0x2b6e3f,
 } as const;
 
 // ── file categorisation ──
@@ -276,6 +282,40 @@ export function markColor(state: RowMarkState): number | undefined {
     default:
       return undefined;
   }
+}
+
+// ── quick filter match highlight ──
+//
+// The same case-insensitive substring rule `state/store.ts`'s
+// `applyQueryFilter` uses to decide whether an entry is visible at all —
+// `filterMatchSpan` exposes *where* it matched too, as JS string indices
+// (not grapheme indices — the same pragmatic choice ui/listView.ts's and
+// ui/gridView.ts's own gitSuffix-splitting code already makes) so those two
+// files can highlight exactly the matched run of characters. Lives here
+// rather than on `state/store.ts` for the same reason `rowMarkState` above
+// takes a structural clipboard type instead of importing `AppState`: this
+// file has no state-layer dependency, and state/store.ts's own file header
+// is explicit that avoiding that kind of cross-import is what keeps the
+// module graph acyclic — state/store.ts imports *this* function, not the
+// other way around.
+
+/**
+ * `null` when there's no active query, or when `query` doesn't occur in
+ * `name` (which shouldn't happen for an entry a caller is actually
+ * rendering, since `applyQueryFilter` already dropped anything that
+ * doesn't match — this still returns `null` rather than throwing, so a
+ * caller never has to special-case the synthetic ".." row itself, which is
+ * never filtered and so can easily fail to "match" a query that happens to
+ * be typed).
+ */
+export function filterMatchSpan(
+  name: string,
+  query: string | null | undefined,
+): { start: number; end: number } | null {
+  if (!query) return null;
+  const idx = name.toLowerCase().indexOf(query.toLowerCase());
+  if (idx < 0) return null;
+  return { start: idx, end: idx + query.length };
 }
 
 // ── goto bookmarks ──

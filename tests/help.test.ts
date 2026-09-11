@@ -42,6 +42,7 @@ function makeState(overrides: Partial<AppState> = {}): AppState {
     overlay: null,
     message: null,
     archive: null,
+    filter: null,
     ...overrides,
   };
 }

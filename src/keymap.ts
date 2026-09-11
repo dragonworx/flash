@@ -6,13 +6,19 @@
 // nothing has to be cross-referenced against `main.ts` to know what a key
 // does.
 //
-// Escape has four jobs, resolved in strict precedence order, first match
+// Escape has five jobs, resolved in strict precedence order, first match
 // wins:
 //   1. An overlay is open -> close it.
-//   2. Marks exist, or a copy/cut is staged -> clear marks and the clipboard.
-//   3. Browsing an archive at its root -> leave the archive.
-//   4. Otherwise -> go up one directory.
-// Arm 2 treats a staged clipboard exactly like marks: the first Escape
+//   2. The `/` quick filter is open -> close it (query discarded, marks and
+//      clipboard left untouched).
+//   3. Marks exist, or a copy/cut is staged -> clear marks and the clipboard.
+//   4. Browsing an archive at its root -> leave the archive.
+//   5. Otherwise -> go up one directory.
+// This is deliberate, user-requested layering: filter, then marks, then
+// navigation, each needing its own Escape before the next is reachable —
+// so a mark placed while filtering survives the filter closing, and only a
+// *second* Escape clears it.
+// Arm 3 treats a staged clipboard exactly like marks: the first Escape
 // clears the selection and the path stays put; only an Escape pressed with
 // nothing selected goes up. A staged cut needs this because `rowMarkState`
 // (term/theme.ts) checks the clipboard before `marked` — clearing only
@@ -22,11 +28,12 @@
 // contract doesn't depend on how the selection was staged. Navigating up
 // with a clipboard staged still works via h/Backspace/←, which bypass this
 // table entirely, so copy -> navigate -> paste is unaffected.
-// All four arms are reachable as of Phase 8: Phase 5a's progress overlay and
-// Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
-// marks have been real since Phase 4; arm 3 (`isArchiveRoot`, below) is real
-// as of Phase 8, once `state/store.ts`'s `enter()` can actually set
-// `state.archive`. The table was written in full back in Phase 2 so each
+// All five arms are reachable: Phase 5a's progress overlay and Phase 7's
+// prompt/confirm/permissions overlays all set `state.overlay`; marks have
+// been real since Phase 4; arm 4 (`isArchiveRoot`, below) is real as of
+// Phase 8, once `state/store.ts`'s `enter()` can actually set
+// `state.archive`; arm 2 (the quick filter) is the newest. The table was
+// written in full back in Phase 2 so each
 // later phase slotted in by editing one guard function, never by
 // restructuring this file — Phase 4 needed no change here at all
 // (`s.marked.size > 0` was already the guard), and Phase 8 only needed
@@ -168,7 +175,15 @@ export type Action =
   | { type: "startBookmarks" }
   | { type: "bookmarksMove"; delta: number }
   | { type: "bookmarksMoveTo"; pos: "home" | "end" }
-  | { type: "selectBookmark" };
+  | { type: "selectBookmark" }
+  // The `/` quick filter (state/store.ts's `startFilter`). Not gated behind
+  // an overlay check the way every other `startX` action above is — see
+  // `resolveFilterKey` below and the `filter` field's comment on
+  // `AppState` for why it needs its own top-level capture instead.
+  | { type: "startFilter" }
+  | { type: "filterChar"; ch: string }
+  | { type: "filterBackspace" }
+  | { type: "closeFilter" };
 
 // ── the bindings table ──
 //
@@ -354,6 +369,13 @@ export const BINDINGS: KeyBinding[] = [
     matches: bare("`"),
     action: () => ({ type: "goHome" }),
   },
+  {
+    display: ["/"],
+    description: "Filter the current listing by name",
+    category: "navigation",
+    matches: bare("/"),
+    action: () => ({ type: "startFilter" }),
+  },
 
   // ── file operations ──
   {
@@ -514,6 +536,7 @@ function isArchiveRoot(state: AppState): boolean {
 
 const ESCAPE_PRECEDENCE: EscapeGuard[] = [
   (s) => (s.overlay ? { type: "closeOverlay" } : null),
+  (s) => (s.filter ? { type: "closeFilter" } : null),
   (s) =>
     s.marked.size > 0 || s.clipboard !== null ? { type: "clearMarks" } : null,
   (s) => (isArchiveRoot(s) ? { type: "leaveArchive" } : null),
@@ -768,6 +791,65 @@ function resolvePreviewKey(key: Key): Action | null {
   }
 }
 
+// ── the `/` quick filter ──
+//
+// Unlike every overlay-capture resolver above, this one does not swallow
+// navigation or marking: up/down/PgUp/PgDn/Home/End move the cursor on the
+// filtered list, Tab toggles the mark at the cursor, and Enter opens the
+// entry under it — all per the user's explicit ask that those keep working
+// while filtering. Everything else printable (letters included, even ones
+// that are file-op shortcuts in the plain browser — `c`, `d`, `p`, etc.)
+// becomes query text instead, the same "capture typing" precedent
+// `resolvePromptKey` already set for the rename/mkdir editor. Escape is
+// handled unconditionally before this ever runs (see `ESCAPE_PRECEDENCE`'s
+// arm 2 above), so it never reaches here.
+const FILTER_SWALLOWED_NAMES = new Set([
+  "left",
+  "right",
+  "insert",
+  "f1",
+  "f2",
+  "f3",
+  "f4",
+  "f5",
+  "f6",
+  "f7",
+  "f8",
+  "f9",
+  "f10",
+  "f11",
+  "f12",
+]);
+
+function resolveFilterKey(key: Key): Action | null {
+  if (key.ctrl || key.alt) return null;
+  switch (key.name) {
+    case "up":
+      return { type: "navigate", dir: "up" };
+    case "down":
+      return { type: "navigate", dir: "down" };
+    case "pageup":
+      return { type: "pageMove", direction: "up" };
+    case "pagedown":
+      return { type: "pageMove", direction: "down" };
+    case "home":
+      return { type: "moveCursorTo", pos: "home" };
+    case "end":
+      return { type: "moveCursorTo", pos: "end" };
+    case "tab":
+      return { type: "toggleMark" };
+    case "enter":
+      return { type: "enter" };
+    case "backspace":
+      return { type: "filterBackspace" };
+    case "space":
+      return { type: "filterChar", ch: " " };
+    default:
+      if (FILTER_SWALLOWED_NAMES.has(key.name)) return null;
+      return { type: "filterChar", ch: key.name };
+  }
+}
+
 // ── the rest of the bindings: driven entirely by `BINDINGS` above ──
 
 /**
@@ -779,6 +861,7 @@ function resolvePreviewKey(key: Key): Action | null {
  */
 export function resolveAction(key: Key, state: AppState): Action | null {
   if (key.name === "escape") return resolveEscape(state);
+  if (state.filter) return resolveFilterKey(key);
   if (state.overlay?.kind === "prompt") return resolvePromptKey(key);
   if (state.overlay?.kind === "confirm") return resolveConfirmKey(key);
   if (state.overlay?.kind === "permissions") return resolvePermissionsKey(key);

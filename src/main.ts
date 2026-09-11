@@ -47,6 +47,7 @@ import { truncate } from "./term/width.ts";
 import {
   computeFrame,
   renderBanner,
+  renderFilterBar,
   renderRule,
   renderStatusBar,
 } from "./ui/chrome.ts";
@@ -362,6 +363,7 @@ function draw(screen: Screen): void {
         state.clipboard,
         bookmarks,
         gitStatuses,
+        state.filter?.query ?? null,
       );
     } else if (listLayout !== null) {
       store.ensureVisible(frame.listHeight);
@@ -383,19 +385,34 @@ function draw(screen: Screen): void {
         store.dirSizes(),
         store.bookmarkedPaths(),
         store.gitStatuses(),
+        after.filter?.query ?? null,
       );
     }
   }
 
   if (frame.footerRuleY !== null) renderRule(screen, frame.footerRuleY, w);
   if (frame.statusY !== null) {
-    renderStatusBar(screen, 0, frame.statusY, w, {
-      itemCount: store.itemCount(),
-      markedCount: state.marked.size,
-      clipboard: state.clipboard,
-      message: state.message,
-      selectedSize: store.selectedSize(),
-    });
+    if (state.filter) {
+      const matchCount = store
+        .visibleEntries()
+        .filter((e) => e.name !== "..").length;
+      renderFilterBar(
+        screen,
+        0,
+        frame.statusY,
+        w,
+        state.filter.query,
+        matchCount,
+      );
+    } else {
+      renderStatusBar(screen, 0, frame.statusY, w, {
+        itemCount: store.itemCount(),
+        markedCount: state.marked.size,
+        clipboard: state.clipboard,
+        message: state.message,
+        selectedSize: store.selectedSize(),
+      });
+    }
   }
 
   // Drawn last so it sits on top of the list/chrome underneath, per the
@@ -845,6 +862,18 @@ input.onKey((key: Key) => {
       store
         .selectBookmark()
         .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
+    case "startFilter":
+      store.startFilter();
+      break;
+    case "filterChar":
+      store.filterChar(action.ch);
+      break;
+    case "filterBackspace":
+      store.filterBackspace();
+      break;
+    case "closeFilter":
+      store.closeFilter();
       break;
   }
 });

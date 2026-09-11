@@ -39,6 +39,7 @@ import {
   MARK_GLYPH,
   colorFor,
   colors,
+  filterMatchSpan,
   gitStatusColor,
   gitStatusSuffix,
   iconFor,
@@ -214,6 +215,45 @@ export function clampGridScroll(
 // are adjacent columns, so a cell that is both the cursor and marked shows
 // both at once with no special-casing.
 
+/**
+ * Draw `text` at `(x, y)`, highlighting `match` (JS string indices into
+ * `text`, already clamped to `text`'s own length by the caller) with
+ * `colors.matchHighlight` instead of `style.bg` — same helper, same
+ * reasoning, as ui/listView.ts's `putNameRun`. Returns the column width
+ * actually used (unpadded) for the same reason: the caller still has its
+ * own gitSuffix/padding to place after this.
+ */
+function putNameRun(
+  screen: Screen,
+  x: number,
+  y: number,
+  text: string,
+  match: { start: number; end: number } | null,
+  style: Style,
+): number {
+  if (!match || match.start >= match.end) {
+    screen.put(x, y, text, style);
+    return stringWidth(text);
+  }
+  const before = text.slice(0, match.start);
+  const hit = text.slice(match.start, match.end);
+  const after = text.slice(match.end);
+  let cx = x;
+  if (before) {
+    screen.put(cx, y, before, style);
+    cx += stringWidth(before);
+  }
+  if (hit) {
+    screen.put(cx, y, hit, { ...style, bg: colors.matchHighlight });
+    cx += stringWidth(hit);
+  }
+  if (after) {
+    screen.put(cx, y, after, style);
+    cx += stringWidth(after);
+  }
+  return cx - x;
+}
+
 function renderCell(
   screen: Screen,
   x: number,
@@ -226,6 +266,7 @@ function renderCell(
   clipboard: ClipboardLike,
   bookmarks: ReadonlySet<string>,
   gitStatuses: ReadonlyMap<string, GitStatus | null>,
+  filterQuery: string | null,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -261,17 +302,22 @@ function renderCell(
   const displayName = `${entry.name}${bookmarkSuffix}${gitSuffix}`;
   const truncated = truncate(displayName, nameWidth);
   const nameX = x + MARKER_WIDTH + ICON_WIDTH;
+  // Never highlights the synthetic ".." row — same reasoning as
+  // ui/listView.ts's renderRow.
+  const match =
+    entry.name === ".." ? null : filterMatchSpan(entry.name, filterQuery);
+  const nameStyle: Style = { ...rowStyle, fg, attr: contentAttr };
   // Same split-for-color approach as ui/listView.ts's renderRow — see its
-  // comment.
+  // comment, including why `basePart` never needs its own clamping below.
   if (gitSuffix && truncated.endsWith(gitSuffix)) {
     const basePart = truncated.slice(0, truncated.length - gitSuffix.length);
-    screen.put(nameX, y, basePart, { ...rowStyle, fg, attr: contentAttr });
-    screen.put(nameX + stringWidth(basePart), y, gitSuffix, {
+    const baseWidth = putNameRun(screen, nameX, y, basePart, match, nameStyle);
+    screen.put(nameX + baseWidth, y, gitSuffix, {
       ...rowStyle,
       fg: gitStatusColor(gitStatus),
       attr: contentAttr,
     });
-    const usedWidth = stringWidth(truncated);
+    const usedWidth = baseWidth + stringWidth(gitSuffix);
     if (usedWidth < nameWidth) {
       screen.put(nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
         ...rowStyle,
@@ -280,11 +326,27 @@ function renderCell(
       });
     }
   } else {
-    screen.put(nameX, y, pad(truncated, nameWidth), {
-      ...rowStyle,
-      fg,
-      attr: contentAttr,
-    });
+    const wasCut = truncated.length < displayName.length;
+    const survivingLimit = wasCut ? truncated.length - 1 : truncated.length;
+    const clamped = match && {
+      start: Math.min(match.start, survivingLimit),
+      end: Math.min(match.end, survivingLimit),
+    };
+    const usedWidth = putNameRun(
+      screen,
+      nameX,
+      y,
+      truncated,
+      clamped,
+      nameStyle,
+    );
+    if (usedWidth < nameWidth) {
+      screen.put(nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
+        ...rowStyle,
+        fg,
+        attr: contentAttr,
+      });
+    }
   }
 }
 
@@ -308,6 +370,7 @@ export function renderGridView(
   clipboard: ClipboardLike = null,
   bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
   gitStatuses: ReadonlyMap<string, GitStatus | null> = EMPTY_GIT_STATUSES,
+  filterQuery: string | null = null,
 ): void {
   if (width <= 0 || height <= 0 || entries.length === 0) return;
   const layout = computeGridLayout(
@@ -337,6 +400,7 @@ export function renderGridView(
         clipboard,
         bookmarks,
         gitStatuses,
+        filterQuery,
       );
     }
   }

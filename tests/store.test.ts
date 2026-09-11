@@ -336,6 +336,138 @@ describe("Store.cycleSort / toggleSortReverse", () => {
   });
 });
 
+describe("Store: quick filter ('/')", () => {
+  // Fixture recap (see beforeAll above): alpha/ (dir), beta/ (dir),
+  // top.txt, .dotfile (hidden by default) — so the unfiltered listing is
+  // [.., alpha, beta, top.txt].
+
+  it("startFilter opens with an empty query, unfiltered", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    expect(store.getState().filter).toEqual({ query: "" });
+    expect(store.visibleEntries().map((e) => e.name)).toEqual([
+      "..",
+      "alpha",
+      "beta",
+      "top.txt",
+    ]);
+  });
+
+  it("filterChar narrows to partial, case-insensitive name matches", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("A"); // alpha and beta both contain 'a'
+    expect(store.visibleEntries().map((e) => e.name)).toEqual([
+      "..",
+      "alpha",
+      "beta",
+    ]);
+    store.filterChar("l"); // now only "alpha" contains "al"
+    expect(store.visibleEntries().map((e) => e.name)).toEqual(["..", "alpha"]);
+  });
+
+  it("never filters out the synthetic '..' row", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("zzz-no-such-match");
+    expect(store.visibleEntries().map((e) => e.name)).toEqual([".."]);
+  });
+
+  it("filterBackspace widens the match set again", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("a");
+    store.filterChar("l");
+    expect(store.visibleEntries().map((e) => e.name)).toEqual(["..", "alpha"]);
+    store.filterBackspace();
+    expect(store.getState().filter?.query).toBe("a");
+    expect(store.visibleEntries().map((e) => e.name)).toEqual([
+      "..",
+      "alpha",
+      "beta",
+    ]);
+  });
+
+  it("filterBackspace on an empty query is a no-op", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterBackspace();
+    expect(store.getState().filter).toEqual({ query: "" });
+  });
+
+  it("keeps the cursor on the same entry when it's still visible", async () => {
+    const store = await makeLoadedStore();
+    const betaIdx = store.visibleEntries().findIndex((e) => e.name === "beta");
+    store.setCursorIndex(betaIdx);
+    store.startFilter();
+    store.filterChar("a"); // alpha and beta both still match
+    expect(store.visibleEntries()[store.getState().cursor]?.name).toBe("beta");
+  });
+
+  it("clamps the cursor when the entry under it is filtered out", async () => {
+    const store = await makeLoadedStore();
+    const topIdx = store
+      .visibleEntries()
+      .findIndex((e) => e.name === "top.txt");
+    store.setCursorIndex(topIdx);
+    store.startFilter();
+    store.filterChar("a"); // "top.txt" no longer matches — cursor must land in range
+    const list = store.visibleEntries();
+    expect(store.getState().cursor).toBeLessThan(list.length);
+    expect(list[store.getState().cursor]?.name).not.toBe("top.txt");
+  });
+
+  it("closeFilter drops the query and returns to the unfiltered listing", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("a");
+    store.closeFilter();
+    expect(store.getState().filter).toBeNull();
+    expect(store.visibleEntries().map((e) => e.name)).toEqual([
+      "..",
+      "alpha",
+      "beta",
+      "top.txt",
+    ]);
+  });
+
+  it("closeFilter leaves marks placed while filtering untouched", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("a");
+    const alphaIdx = store
+      .visibleEntries()
+      .findIndex((e) => e.name === "alpha");
+    store.setCursorIndex(alphaIdx);
+    store.toggleMarkAtCursor();
+    expect(store.getState().marked.size).toBe(1);
+
+    store.closeFilter();
+    expect(store.getState().filter).toBeNull();
+    expect(store.getState().marked.size).toBe(1);
+  });
+
+  it("a real navigation (entering a directory) clears the active filter", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("a");
+    const alphaIdx = store
+      .visibleEntries()
+      .findIndex((e) => e.name === "alpha");
+    store.setCursorIndex(alphaIdx);
+    await store.enter();
+    expect(store.getState().filter).toBeNull();
+  });
+
+  it("startFilter refuses while a filter is already open", async () => {
+    const store = await makeLoadedStore();
+    store.startFilter();
+    store.filterChar("a");
+    store.startFilter();
+    expect(store.getState().filter).toEqual({ query: "a" });
+  });
+});
+
 describe("Store.load error handling", () => {
   it("surfaces a readdir failure as scanError instead of throwing", async () => {
     const store = new Store({ cwd: root });

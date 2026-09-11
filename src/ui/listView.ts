@@ -62,6 +62,7 @@ import {
   MARK_GLYPH,
   colorFor,
   colors,
+  filterMatchSpan,
   gitStatusColor,
   gitStatusSuffix,
   iconFor,
@@ -244,6 +245,48 @@ export function renderListHeader(
 
 // ── rendering ──
 
+/**
+ * Draw `text` at `(x, y)`, highlighting `match` (JS string indices into
+ * `text`, already clamped to `text`'s own length by the caller) with
+ * `colors.matchHighlight` instead of `style.bg`, everything else in
+ * `style` unchanged — the `/` quick filter's "here's what matched" cue
+ * (see term/theme.ts's `filterMatchSpan`). Returns the column width
+ * actually used, not padded: the gitSuffix-split branch below still needs
+ * to place its own suffix right after this, and the plain branch pads the
+ * remainder itself — same "caller pads, this just draws" split the
+ * gitSuffix code already used for its own two-part `screen.put` pair.
+ */
+function putNameRun(
+  screen: Screen,
+  x: number,
+  y: number,
+  text: string,
+  match: { start: number; end: number } | null,
+  style: Style,
+): number {
+  if (!match || match.start >= match.end) {
+    screen.put(x, y, text, style);
+    return stringWidth(text);
+  }
+  const before = text.slice(0, match.start);
+  const hit = text.slice(match.start, match.end);
+  const after = text.slice(match.end);
+  let cx = x;
+  if (before) {
+    screen.put(cx, y, before, style);
+    cx += stringWidth(before);
+  }
+  if (hit) {
+    screen.put(cx, y, hit, { ...style, bg: colors.matchHighlight });
+    cx += stringWidth(hit);
+  }
+  if (after) {
+    screen.put(cx, y, after, style);
+    cx += stringWidth(after);
+  }
+  return cx - x;
+}
+
 function renderRow(
   screen: Screen,
   x: number,
@@ -259,6 +302,7 @@ function renderRow(
   dirSizes: ReadonlyMap<string, number>,
   bookmarks: ReadonlySet<string>,
   gitStatuses: ReadonlyMap<string, GitStatus | null>,
+  filterQuery: string | null,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -303,18 +347,36 @@ function renderRow(
   const gitSuffix = gitStatusSuffix(gitStatus);
   const displayName = `${entry.name}${bookmarkSuffix}${gitSuffix}`;
   const truncated = truncate(displayName, nameWidth);
+  // Never highlights the synthetic ".." row, even if it happens to contain
+  // whatever's typed — it's never filtered out by `applyQueryFilter`
+  // either, so "visible but not actually a match" is the correct state for
+  // it to be in.
+  const match =
+    entry.name === ".." ? null : filterMatchSpan(entry.name, filterQuery);
+  const nameStyle: Style = { ...rowStyle, fg, attr: contentAttr };
   // Color the git suffix on its own (see term/theme.ts's `gitStatusColor`)
   // only when truncation left it fully intact — a suffix clipped by a
   // narrow column falls back to the row's plain color below.
   if (gitSuffix && truncated.endsWith(gitSuffix)) {
     const basePart = truncated.slice(0, truncated.length - gitSuffix.length);
-    screen.put(x + nameX, y, basePart, { ...rowStyle, fg, attr: contentAttr });
-    screen.put(x + nameX + stringWidth(basePart), y, gitSuffix, {
+    // `basePart` is always the *untruncated* name+bookmark here — if either
+    // had been cut, the walk that builds `truncated` would never have
+    // reached gitSuffix's own characters at all, so `match` (computed
+    // against the full `entry.name`) needs no further clamping.
+    const baseWidth = putNameRun(
+      screen,
+      x + nameX,
+      y,
+      basePart,
+      match,
+      nameStyle,
+    );
+    screen.put(x + nameX + baseWidth, y, gitSuffix, {
       ...rowStyle,
       fg: gitStatusColor(gitStatus),
       attr: contentAttr,
     });
-    const usedWidth = stringWidth(truncated);
+    const usedWidth = baseWidth + stringWidth(gitSuffix);
     if (usedWidth < nameWidth) {
       screen.put(x + nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
         ...rowStyle,
@@ -323,11 +385,30 @@ function renderRow(
       });
     }
   } else {
-    screen.put(x + nameX, y, pad(truncated, nameWidth), {
-      ...rowStyle,
-      fg,
-      attr: contentAttr,
-    });
+    // `truncated` may have cut into (or entirely past) the matched run —
+    // clamp `match` to whatever actually survived, excluding the trailing
+    // "…" truncate() appends on a real cut (never part of the name itself).
+    const wasCut = truncated.length < displayName.length;
+    const survivingLimit = wasCut ? truncated.length - 1 : truncated.length;
+    const clamped = match && {
+      start: Math.min(match.start, survivingLimit),
+      end: Math.min(match.end, survivingLimit),
+    };
+    const usedWidth = putNameRun(
+      screen,
+      x + nameX,
+      y,
+      truncated,
+      clamped,
+      nameStyle,
+    );
+    if (usedWidth < nameWidth) {
+      screen.put(x + nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
+        ...rowStyle,
+        fg,
+        attr: contentAttr,
+      });
+    }
   }
 
   if (entry.error) {
@@ -381,6 +462,7 @@ export function renderListView(
   dirSizes: ReadonlyMap<string, number> = EMPTY_DIR_SIZES,
   bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
   gitStatuses: ReadonlyMap<string, GitStatus | null> = EMPTY_GIT_STATUSES,
+  filterQuery: string | null = null,
 ): void {
   if (width <= 0 || height <= 0) return;
   for (let row = 0; row < height; row++) {
@@ -402,6 +484,7 @@ export function renderListView(
       dirSizes,
       bookmarks,
       gitStatuses,
+      filterQuery,
     );
   }
 }

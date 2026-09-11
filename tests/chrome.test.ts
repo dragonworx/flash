@@ -5,6 +5,7 @@ import { describe, expect, it } from "bun:test";
 import { stringWidth } from "../src/term/width.ts";
 import {
   formatBreadcrumb,
+  formatFilterLeft,
   formatItemCount,
   formatStatusLeft,
   formatStatusRight,
@@ -112,6 +113,13 @@ describe("formatStatusLeft (Phase 4: mark count + clipboard state)", () => {
     expect(formatStatusLeft({ itemCount: 12, clipboard: null })).toBe(
       "12 items",
     );
+  });
+});
+
+describe("formatFilterLeft", () => {
+  it("prefixes the query with the '/' that opened it", () => {
+    expect(formatFilterLeft("")).toBe("/");
+    expect(formatFilterLeft("abc")).toBe("/abc");
   });
 });
 

@@ -129,6 +129,7 @@ import {
   sortEntries,
 } from "../fsapi/scan.ts";
 import { type StyledSegment, parseAnsiLines } from "../term/ansiParse.ts";
+import { filterMatchSpan } from "../term/theme.ts";
 import { graphemes, stringWidth } from "../term/width.ts";
 import {
   backspace as fieldBackspace,
@@ -268,6 +269,19 @@ export type AppState = {
   overlay: Overlay | null;
   message: Message | null;
   archive: { zipPath: string; innerPath: string } | null;
+  /**
+   * The `/` quick filter's live query, or `null` when it's closed. Deliberately
+   * not an `Overlay` variant: every overlay above captures the *entire*
+   * keyboard and is drawn as a modal box on top of the list (see
+   * keymap.ts's per-overlay resolvers and main.ts's overlay if/else-if
+   * chain), whereas filtering keeps the list fully interactive — the cursor
+   * still moves, Tab still marks — and only replaces the footer status bar
+   * (see ui/chrome.ts's `renderFilterBar`). See `startFilter`/`filterChar`/
+   * `filterBackspace`/`closeFilter` below, and keymap.ts's `resolveFilterKey`
+   * for exactly which keys it captures as query text versus passes through
+   * as navigation/marking.
+   */
+  filter: { query: string } | null;
 };
 
 export type StoreInit = {
@@ -398,6 +412,7 @@ export class Store {
       overlay: null,
       message: null,
       archive: null,
+      filter: null,
     };
     this.refreshGotoBookmarks();
   }
@@ -461,12 +476,30 @@ export class Store {
    */
   visibleEntries(): Entry[] {
     const raw = this.rawEntries();
-    const filtered = this.state.showHidden
+    const hidden = this.state.showHidden
       ? raw
       : raw.filter((e) => !e.name.startsWith("."));
-    const sorted = sortEntries(filtered, this.state.sort);
+    const queried = this.applyQueryFilter(hidden);
+    const sorted = sortEntries(queried, this.state.sort);
     const parent = this.parentEntry();
     return parent ? [parent, ...sorted] : sorted;
+  }
+
+  /**
+   * The `/` quick filter: a case-insensitive substring match against each
+   * entry's name (`term/theme.ts`'s `filterMatchSpan` — the same rule
+   * ui/listView.ts and ui/gridView.ts use to highlight *where* it matched),
+   * applied after hidden-file filtering and before sorting (order doesn't
+   * matter for a substring test, but doing it before `sortEntries` means
+   * sorting never has to walk entries this will drop). Never touches the
+   * synthetic ".." row — `visibleEntries()` prepends that separately, after
+   * this runs, so going up stays reachable while a filter is narrowing
+   * everything else down to zero matches.
+   */
+  private applyQueryFilter(entries: Entry[]): Entry[] {
+    const query = this.state.filter?.query;
+    if (!query) return entries;
+    return entries.filter((e) => filterMatchSpan(e.name, query) !== null);
   }
 
   /** Count of real entries only (never counts the synthetic ".." row). */
@@ -543,6 +576,9 @@ export class Store {
       this.state.entries = [];
       this.state.scanError = result.error;
     }
+    // A navigation leaves whatever was filtered in the old listing behind —
+    // see the `filter` field's comment on `AppState`.
+    this.state.filter = null;
     this.state.scrollTop = 0;
     this.resetCursorToTop();
     this.refreshGotoBookmarks();
@@ -759,6 +795,7 @@ export class Store {
         ...archive,
         innerPath: archiveChildInner(archive.innerPath, entry.name),
       };
+      this.state.filter = null;
       this.state.cursor = 0;
       this.state.scrollTop = 0;
       this.notify();
@@ -804,6 +841,7 @@ export class Store {
     }
     this.archiveTree = tree;
     this.state.archive = { zipPath, innerPath: "" };
+    this.state.filter = null;
     this.resetRangeAnchor();
     this.state.cursor = 0;
     this.state.scrollTop = 0;
@@ -852,6 +890,7 @@ export class Store {
       ...archive,
       innerPath: archiveParentInner(archive.innerPath),
     };
+    this.state.filter = null;
     this.state.scrollTop = 0;
     this.resetCursorToTop();
     this.notify();
@@ -867,6 +906,7 @@ export class Store {
     if (!archive) return;
     this.state.archive = null;
     this.archiveTree = null;
+    this.state.filter = null;
     this.state.scrollTop = 0;
     this.resetCursorToTop();
     this.notify();
@@ -986,6 +1026,73 @@ export class Store {
     const list = this.visibleEntries();
     const currentName = list[this.state.cursor]?.name;
     this.state.sort = sort;
+    this.setCursorByName(currentName);
+    this.notify();
+  }
+
+  // ── quick filter ("/") ──
+  //
+  // Unlike every `startX` overlay above, this does not set `state.overlay`
+  // — see the `filter` field's comment on `AppState` for why. keymap.ts's
+  // `resolveFilterKey` is what actually routes most keys elsewhere
+  // (navigation, Tab-to-mark) while `state.filter` is set; only genuine
+  // query-editing keys reach the three methods below.
+
+  /**
+   * `/`: open the filter with an empty query. Refuses while any overlay is
+   * already open (same guard every other `startX` method uses) or while a
+   * filter is already open — "/" typed at that point is query text (see
+   * `resolveFilterKey`), not a re-trigger.
+   */
+  startFilter(): void {
+    if (this.state.overlay || this.state.filter) return;
+    this.resetRangeAnchor();
+    this.state.filter = { query: "" };
+    this.notify();
+  }
+
+  /** Append one typed character to the query, live-narrowing `visibleEntries()`. */
+  filterChar(ch: string): void {
+    if (!this.state.filter) return;
+    this.setFilterQuery(this.state.filter.query + ch);
+  }
+
+  /** Remove the last character of the query; a no-op once it's already empty. */
+  filterBackspace(): void {
+    if (!this.state.filter || this.state.filter.query.length === 0) return;
+    this.setFilterQuery(this.state.filter.query.slice(0, -1));
+  }
+
+  /**
+   * Shared by `filterChar`/`filterBackspace`: narrowing or widening the
+   * query can easily move the cursor's target out of the filtered list (or
+   * back into it), so this re-lands the cursor on the same entry by name
+   * when it's still visible — same "preserve what's under the cursor"
+   * pattern `toggleHidden`/`setSort` already use — rather than letting it
+   * drift to whatever index happened to be numerically valid.
+   */
+  private setFilterQuery(query: string): void {
+    const list = this.visibleEntries();
+    const currentName = list[this.state.cursor]?.name;
+    this.state.filter = { query };
+    this.setCursorByName(currentName);
+    this.notify();
+  }
+
+  /**
+   * Esc's dedicated precedence arm while filtering (see keymap.ts's
+   * `ESCAPE_PRECEDENCE`, checked ahead of the "clear marks" arm): drops the
+   * query entirely and returns to the unfiltered listing, landing back on
+   * the same entry when it's still there. Deliberately leaves `marked` and
+   * `clipboard` untouched — a mark placed while filtered must survive the
+   * filter closing, exactly as the user asked for, so a second Esc (the
+   * ordinary "clear marks" arm) is what clears those.
+   */
+  closeFilter(): void {
+    if (!this.state.filter) return;
+    const list = this.visibleEntries();
+    const currentName = list[this.state.cursor]?.name;
+    this.state.filter = null;
     this.setCursorByName(currentName);
     this.notify();
   }

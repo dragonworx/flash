@@ -406,6 +406,47 @@ export function formatStatusRight(bytes: number): string {
  * stray last line — `renderRule` above already separates it from the body
  * when `frame.footerRuleY` is set.
  */
+// ── filter bar ──
+//
+// The `/` quick filter (state/store.ts's `startFilter`) replaces the whole
+// status-bar row with this instead — main.ts's draw() picks one or the
+// other, never both, based on `state.filter`.
+
+/**
+ * The filter bar's left-hand text: `/` plus whatever's been typed so far.
+ * There's no separate text-cursor glyph — the query is append/backspace-only
+ * (see state/store.ts's `filterChar`/`filterBackspace`), so the end of the
+ * typed text already *is* where the next character lands. Pure, same
+ * "layout regression shows up in a plain unit test" reasoning as
+ * `formatStatusLeft`.
+ */
+export function formatFilterLeft(query: string): string {
+  return `/${query}`;
+}
+
+/**
+ * Draw the filter bar: the live query on the left, the current match count
+ * on the right — same footer-strip look (`colors.footerBg` across the full
+ * width) as `renderStatusBar`, just with different content on both sides.
+ */
+export function renderFilterBar(
+  screen: Screen,
+  x: number,
+  y: number,
+  width: number,
+  query: string,
+  matchCount: number,
+): void {
+  const style: Style = { bg: colors.footerBg };
+  const left = formatFilterLeft(query);
+  screen.put(x, y, pad(` ${left}`, width), { ...style, fg: colors.accent });
+
+  const right = `${matchCount} match${matchCount === 1 ? "" : "es"} `;
+  const text = truncate(right, width);
+  const startX = x + Math.max(width - stringWidth(text), 0);
+  screen.put(startX, y, text, { ...style, fg: colors.dim });
+}
+
 export function renderStatusBar(
   screen: Screen,
   x: number,
