@@ -1,5 +1,6 @@
 node_modules/
 dist/
+!dist/flash
 *.log
 
 # Created at test setup, not committed — see tests/scan.test.ts and
