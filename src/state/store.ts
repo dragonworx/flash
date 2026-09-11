@@ -96,6 +96,11 @@ import {
   loadArchiveTree,
 } from "../fsapi/archive/vfs.ts";
 import type { Entry } from "../fsapi/entry.ts";
+import {
+  type GitStatus,
+  gitStatusFor,
+  isGitRepoRoot,
+} from "../fsapi/gitStatus.ts";
 import { type GotoBookmark, loadGotoBookmarks } from "../fsapi/goto.ts";
 import { chmodPreserving } from "../fsapi/ops/chmod.ts";
 import { uniqueName } from "../fsapi/ops/conflict.ts";
@@ -292,6 +297,11 @@ const DELETE_COUNT_CAP = 1000;
 // a handful of workers pulling from a shared queue instead.
 const DIR_SIZE_CONCURRENCY = 4;
 
+// Same reasoning as DIR_SIZE_CONCURRENCY, for `scheduleGitStatusScan` — a
+// listing full of git repos shouldn't fire a `git status` subprocess per
+// row all at once either.
+const GIT_STATUS_CONCURRENCY = 4;
+
 // ── Store ──
 
 export class Store {
@@ -352,6 +362,16 @@ export class Store {
   // controller per `scheduleDirSizeScan()` call, since a fresh navigation
   // or rescan makes the previous batch's queue stale.
   private dirSizeBatchAbort: AbortController | null = null;
+  // Same shape as `dirSizeCache`, for the git-repo marker (`fsapi/gitStatus.ts`)
+  // ui/listView.ts and ui/gridView.ts draw after a directory's name. `null`
+  // is a cached result too — "checked, not a repo (or git is missing)" —
+  // distinct from a path simply not being a key yet ("not checked"), which
+  // is what lets `scheduleGitStatusScan` skip re-probing a plain, non-repo
+  // subdirectory every time its parent is rescanned.
+  private gitStatusCache = new Map<string, GitStatus | null>();
+  // Same shape as `dirSizeBatchAbort`, one shared controller per
+  // `scheduleGitStatusScan()` call.
+  private gitStatusBatchAbort: AbortController | null = null;
   // goto's bookmarks (`fsapi/goto.ts`), reloaded fresh off disk by
   // `load()` (every real navigation) and `startBookmarks()` — not part of
   // `AppState`, same reasoning as `dirSizeCache` above: the renderer only
@@ -527,6 +547,7 @@ export class Store {
     this.resetCursorToTop();
     this.refreshGotoBookmarks();
     this.scheduleDirSizeScan();
+    this.scheduleGitStatusScan();
     this.notify();
   }
 
@@ -596,6 +617,14 @@ export class Store {
       if (dirname(p) === dir) this.dirSizeCache.delete(p);
     }
     this.scheduleDirSizeScan();
+    // Same reasoning as the dirSizeCache drop above, for a listed
+    // directory's git status — a rescan of `dir` (typically the watcher
+    // firing because something inside it changed) can easily mean one of
+    // its git-repo subdirectories just became dirty or clean.
+    for (const p of [...this.gitStatusCache.keys()]) {
+      if (dirname(p) === dir) this.gitStatusCache.delete(p);
+    }
+    this.scheduleGitStatusScan();
     this.notify();
   }
 
@@ -1127,7 +1156,7 @@ export class Store {
   }
 
   /**
-   * The text Ctrl+C/Ctrl+Alt+C (`copyPath`, keymap.ts) puts on the *system*
+   * The text Ctrl+C/Shift+C (`copyPath`, keymap.ts) puts on the *system*
    * clipboard: the marked set's — or, when nothing is marked, the cursor
    * entry's — full paths, same fallback as `stageClipboard`. Paths inside
    * the user's home directory are shortened to a `~/` prefix (and home
@@ -1148,7 +1177,8 @@ export class Store {
       return null;
     }
     const label = paths.length === 1 ? "1 path" : `${paths.length} paths`;
-    this.setMessage(`${label} copied to the system clipboard`);
+    const mode = separator === "space" ? "space-separated" : "one per line";
+    this.setMessage(`${label} copied to the system clipboard (${mode})`);
     return paths.map(shortenHomePath).join(separator === "space" ? " " : "\n");
   }
 
@@ -1227,6 +1257,56 @@ export class Store {
       // have superseded this one while the walk was in flight.
       if (abort.signal.aborted) return;
       this.dirSizeCache.set(path, bytes);
+      this.notify();
+    }
+  }
+
+  /** The list/grid views' git marker (`term/theme.ts`'s `gitStatusSuffix`) reads off this. */
+  gitStatuses(): ReadonlyMap<string, GitStatus | null> {
+    return this.gitStatusCache;
+  }
+
+  /**
+   * Same bounded-concurrency batch shape as `scheduleDirSizeScan` above,
+   * for `fsapi/gitStatus.ts`: a cheap `isGitRepoRoot` check for every
+   * directory in `state.entries`, and only for the ones that pass it, the
+   * actual `git status` spawn. Already-cached paths are skipped, including
+   * ones cached as `null` ("checked, not a repo") — a plain subdirectory
+   * doesn't get re-probed on every rescan just because it isn't a repo.
+   */
+  private scheduleGitStatusScan(): void {
+    this.gitStatusBatchAbort?.abort();
+    const abort = new AbortController();
+    this.gitStatusBatchAbort = abort;
+
+    const queue = this.state.entries
+      .filter((e) => this.isSizableDir(e) && !this.gitStatusCache.has(e.path))
+      .map((e) => e.path);
+    if (queue.length === 0) return;
+
+    const workerCount = Math.min(GIT_STATUS_CONCURRENCY, queue.length);
+    for (let i = 0; i < workerCount; i++) this.runGitStatusWorker(queue, abort);
+  }
+
+  private async runGitStatusWorker(
+    queue: string[],
+    abort: AbortController,
+  ): Promise<void> {
+    while (queue.length > 0) {
+      if (abort.signal.aborted) return;
+      const path = queue.shift();
+      if (path === undefined) return;
+      const isRepo = await isGitRepoRoot(path).catch(() => false);
+      if (abort.signal.aborted) return;
+      if (!isRepo) {
+        this.gitStatusCache.set(path, null);
+        continue;
+      }
+      const status = await gitStatusFor(path, { signal: abort.signal }).catch(
+        () => null,
+      );
+      if (abort.signal.aborted) return;
+      this.gitStatusCache.set(path, status);
       this.notify();
     }
   }

@@ -26,6 +26,7 @@
 // allows.
 
 import type { Entry } from "../fsapi/entry.ts";
+import type { GitStatus } from "../fsapi/gitStatus.ts";
 import {
   ATTR_DIM,
   ATTR_ITALIC,
@@ -38,6 +39,8 @@ import {
   MARK_GLYPH,
   colorFor,
   colors,
+  gitStatusColor,
+  gitStatusSuffix,
   iconFor,
   markColor,
   rowMarkState,
@@ -52,6 +55,8 @@ type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
 const EMPTY_MARKED: ReadonlySet<string> = new Set();
 // Same reasoning, for callers that don't care about goto bookmarks.
 const EMPTY_BOOKMARKS: ReadonlySet<string> = new Set();
+// Same reasoning, for callers that don't care about git status markers.
+const EMPTY_GIT_STATUSES: ReadonlyMap<string, GitStatus | null> = new Map();
 
 // ── layout ──
 
@@ -73,19 +78,25 @@ export type GridLayout = {
 
 /**
  * `entry.width` (see term/width.ts's "never measure width per row per
- * frame" invariant) plus the goto-bookmark star's width when this entry
- * gets one (see renderCell's own ".." exclusion) — callers must feed this,
- * not the bare `entry.width`, into `computeGridLayout`'s `nameWidths`, or a
- * bookmarked name sitting right at the column's width cap gets its star
- * silently truncated off by `truncate()` instead of the column reserving
- * room for it up front.
+ * frame" invariant) plus the goto-bookmark star's and/or the git status
+ * marker's width when this entry gets one (see renderCell's own ".."
+ * exclusion) — callers must feed this, not the bare `entry.width`, into
+ * `computeGridLayout`'s `nameWidths`, or a bookmarked/git-marked name
+ * sitting right at the column's width cap gets its suffix silently
+ * truncated off by `truncate()` instead of the column reserving room for
+ * it up front.
  */
 export function entryDisplayWidth(
   entry: Entry,
   bookmarks: ReadonlySet<string>,
+  gitStatuses: ReadonlyMap<string, GitStatus | null> = EMPTY_GIT_STATUSES,
 ): number {
-  if (entry.name === ".." || !bookmarks.has(entry.path)) return entry.width;
-  return entry.width + stringWidth(BOOKMARK_GLYPH);
+  if (entry.name === "..") return entry.width;
+  const bookmarkWidth = bookmarks.has(entry.path)
+    ? stringWidth(BOOKMARK_GLYPH)
+    : 0;
+  const gitWidth = stringWidth(gitStatusSuffix(gitStatuses.get(entry.path)));
+  return entry.width + bookmarkWidth + gitWidth;
 }
 
 /**
@@ -214,6 +225,7 @@ function renderCell(
   marked: ReadonlySet<string>,
   clipboard: ClipboardLike,
   bookmarks: ReadonlySet<string>,
+  gitStatuses: ReadonlyMap<string, GitStatus | null>,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -242,16 +254,38 @@ function renderCell(
     attr: contentAttr,
   });
   // Same ".." exclusion as ui/listView.ts's renderRow — see its comment.
-  const displayName =
-    entry.name !== ".." && bookmarks.has(entry.path)
-      ? `${entry.name}${BOOKMARK_GLYPH}`
-      : entry.name;
-  screen.put(
-    x + MARKER_WIDTH + ICON_WIDTH,
-    y,
-    pad(truncate(displayName, nameWidth), nameWidth),
-    { ...rowStyle, fg, attr: contentAttr },
-  );
+  const bookmarkSuffix =
+    entry.name !== ".." && bookmarks.has(entry.path) ? BOOKMARK_GLYPH : "";
+  const gitStatus = entry.name !== ".." ? gitStatuses.get(entry.path) : null;
+  const gitSuffix = gitStatusSuffix(gitStatus);
+  const displayName = `${entry.name}${bookmarkSuffix}${gitSuffix}`;
+  const truncated = truncate(displayName, nameWidth);
+  const nameX = x + MARKER_WIDTH + ICON_WIDTH;
+  // Same split-for-color approach as ui/listView.ts's renderRow — see its
+  // comment.
+  if (gitSuffix && truncated.endsWith(gitSuffix)) {
+    const basePart = truncated.slice(0, truncated.length - gitSuffix.length);
+    screen.put(nameX, y, basePart, { ...rowStyle, fg, attr: contentAttr });
+    screen.put(nameX + stringWidth(basePart), y, gitSuffix, {
+      ...rowStyle,
+      fg: gitStatusColor(gitStatus),
+      attr: contentAttr,
+    });
+    const usedWidth = stringWidth(truncated);
+    if (usedWidth < nameWidth) {
+      screen.put(nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
+        ...rowStyle,
+        fg,
+        attr: contentAttr,
+      });
+    }
+  } else {
+    screen.put(nameX, y, pad(truncated, nameWidth), {
+      ...rowStyle,
+      fg,
+      attr: contentAttr,
+    });
+  }
 }
 
 /**
@@ -273,11 +307,12 @@ export function renderGridView(
   marked: ReadonlySet<string> = EMPTY_MARKED,
   clipboard: ClipboardLike = null,
   bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
+  gitStatuses: ReadonlyMap<string, GitStatus | null> = EMPTY_GIT_STATUSES,
 ): void {
   if (width <= 0 || height <= 0 || entries.length === 0) return;
   const layout = computeGridLayout(
     width,
-    entries.map((e) => entryDisplayWidth(e, bookmarks)),
+    entries.map((e) => entryDisplayWidth(e, bookmarks, gitStatuses)),
   );
   if (layout.columns === 0) return;
   const rows = gridRowCount(entries.length, layout.columns);
@@ -301,6 +336,7 @@ export function renderGridView(
         marked,
         clipboard,
         bookmarks,
+        gitStatuses,
       );
     }
   }

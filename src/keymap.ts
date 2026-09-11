@@ -54,7 +54,7 @@ export type Action =
   | { type: "navigate"; dir: "up" | "down" | "left" | "right" }
   | { type: "enter" }
   | { type: "up" }
-  // `~`: jump straight to the user's home directory — a real navigation,
+  // `` ` ``: jump straight to the user's home directory — a real navigation,
   // same as picking a bookmark (state/store.ts's `goHome`).
   | { type: "goHome" }
   | { type: "toggleView" }
@@ -90,10 +90,19 @@ export type Action =
   // (via OSC 52 — see term/osc.ts's `setClipboard`), distinct from `c`,
   // which stages files in flash's own internal clipboard for `p` to paste.
   // `separator` picks the multi-select format: one path per line, or —
-  // with Ctrl+Alt+C — a single space-separated line. This takes Ctrl+C away
-  // from "quit" (`q` remains the quit key), a deliberate trade: the OSC 52
-  // path-copy is the only feature here that needs a Ctrl key anyway, since
-  // every letter is already spoken for.
+  // with Shift+C — a single space-separated line. Shift+C, not a Ctrl or
+  // Alt combo: Ctrl+letter doesn't encode Shift at the terminal-protocol
+  // level (Ctrl+C and Ctrl+Shift+C are typically the same 0x03 byte, and
+  // many emulators intercept Ctrl+Shift+C themselves for native copy before
+  // an app ever sees it), and Ctrl+Alt+<letter> is unreliable in practice —
+  // verified on iTerm2 over SSH through herdr, holding Option together with
+  // Ctrl drops the ESC-prefix Option normally sends and the byte arrives as
+  // plain Ctrl+C, silently falling back to the newline binding. A bare
+  // Shift+letter has no such ambiguity: every terminal just sends the
+  // capital-letter byte, same as the existing `s`/`S` (sort/reverse-sort)
+  // pair. This takes Ctrl+C away from "quit" (`q` remains the quit key), a
+  // deliberate trade: the OSC 52 path-copy is the only feature here that
+  // needs a Ctrl key anyway, since every letter is already spoken for.
   | { type: "copyPath"; separator: "newline" | "space" }
   // Escape-precedence arms. `clearMarks` clears every mark and any staged
   // clipboard (copy *or* cut) — see the file header for why a copy gets the
@@ -212,10 +221,6 @@ function plainArrow(name: string): (key: Key) => boolean {
 
 function withCtrl(name: string): (key: Key) => boolean {
   return (key: Key) => key.ctrl && !key.alt && key.name === name;
-}
-
-function withCtrlAlt(name: string): (key: Key) => boolean {
-  return (key: Key) => key.ctrl && key.alt && key.name === name;
 }
 
 function shiftArrow(name: "up" | "down"): (key: Key) => boolean {
@@ -343,10 +348,10 @@ export const BINDINGS: KeyBinding[] = [
     action: () => ({ type: "startBookmarks" }),
   },
   {
-    display: ["~"],
+    display: ["`"],
     description: "Jump to your home directory",
     category: "navigation",
-    matches: bare("~"),
+    matches: bare("`"),
     action: () => ({ type: "goHome" }),
   },
 
@@ -381,10 +386,10 @@ export const BINDINGS: KeyBinding[] = [
     action: () => ({ type: "copyPath", separator: "newline" }),
   },
   {
-    display: ["Ctrl+Alt+C"],
+    display: ["Shift+C"],
     description: "Same as Ctrl+C, but as a single space-separated line",
     category: "file operations",
-    matches: withCtrlAlt("c"),
+    matches: bare("C"),
     action: () => ({ type: "copyPath", separator: "space" }),
   },
   {

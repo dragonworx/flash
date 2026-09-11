@@ -154,6 +154,98 @@ describe("Store.dirSizes", () => {
   });
 });
 
+describe("Store.gitStatuses", () => {
+  function run(cwd: string, args: string[]): void {
+    const result = Bun.spawnSync(["git", ...args], { cwd });
+    if (result.exitCode !== 0) {
+      throw new Error(
+        `git ${args.join(" ")} failed: ${result.stderr.toString()}`,
+      );
+    }
+  }
+
+  function makeRepo(dir: string): void {
+    mkdirSync(dir);
+    run(dir, ["init", "--quiet"]);
+    run(dir, ["config", "user.email", "test@example.com"]);
+    run(dir, ["config", "user.name", "Test"]);
+  }
+
+  it("marks a clean repo subdirectory and leaves a plain one unmarked", async () => {
+    const scanRoot = mkdtempSync(join(tmpdir(), "flash-store-gitstatus-test-"));
+    try {
+      const repo = join(scanRoot, "repo");
+      makeRepo(repo);
+      writeFileSync(join(repo, "a.txt"), "a");
+      run(repo, ["add", "."]);
+      run(repo, ["commit", "--quiet", "-m", "initial"]);
+      mkdirSync(join(scanRoot, "plain"));
+
+      const store = await makeLoadedStore(scanRoot);
+      await Bun.sleep(300);
+      const list = store.visibleEntries();
+      const repoPath = list.find((e) => e.name === "repo")?.path ?? "";
+      const plainPath = list.find((e) => e.name === "plain")?.path ?? "";
+
+      expect(store.gitStatuses().get(repoPath)).toEqual({
+        dirty: false,
+        changes: 0,
+      });
+      expect(store.gitStatuses().get(plainPath)).toBeNull();
+    } finally {
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("marks a repo with uncommitted changes as dirty, with a change count", async () => {
+    const scanRoot = mkdtempSync(join(tmpdir(), "flash-store-gitstatus-test-"));
+    try {
+      const repo = join(scanRoot, "repo");
+      makeRepo(repo);
+      writeFileSync(join(repo, "a.txt"), "a"); // untracked
+
+      const store = await makeLoadedStore(scanRoot);
+      await Bun.sleep(300);
+      const repoPath =
+        store.visibleEntries().find((e) => e.name === "repo")?.path ?? "";
+
+      expect(store.gitStatuses().get(repoPath)).toEqual({
+        dirty: true,
+        changes: 1,
+      });
+    } finally {
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("recomputes a rescanned directory's own dirty status rather than keeping the stale one", async () => {
+    const scanRoot = mkdtempSync(join(tmpdir(), "flash-store-gitstatus-test-"));
+    try {
+      const repo = join(scanRoot, "repo");
+      makeRepo(repo);
+      writeFileSync(join(repo, "a.txt"), "a");
+      run(repo, ["add", "."]);
+      run(repo, ["commit", "--quiet", "-m", "initial"]);
+
+      const store = await makeLoadedStore(scanRoot);
+      await Bun.sleep(300);
+      const repoPath =
+        store.visibleEntries().find((e) => e.name === "repo")?.path ?? "";
+      expect(store.gitStatuses().get(repoPath)?.dirty).toBe(false);
+
+      writeFileSync(join(repo, "b.txt"), "b"); // now dirty
+      await store.refresh(scanRoot);
+      await Bun.sleep(300);
+      expect(store.gitStatuses().get(repoPath)).toEqual({
+        dirty: true,
+        changes: 1,
+      });
+    } finally {
+      rmSync(scanRoot, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("Store navigation", () => {
   it("enter() descends into the directory under the cursor", async () => {
     const store = await makeLoadedStore();
@@ -482,7 +574,7 @@ describe("Store clipboard (copy/cut)", () => {
   });
 });
 
-describe("Store.pathClipboardText (Ctrl+C / Ctrl+Alt+C)", () => {
+describe("Store.pathClipboardText (Ctrl+C / Shift+C)", () => {
   it("joins the marked set one path per line for the newline separator", async () => {
     const store = await makeSelStore();
     store.setCursorIndex(indexOf(store, "f1.txt"));
@@ -523,12 +615,21 @@ describe("Store.pathClipboardText (Ctrl+C / Ctrl+Alt+C)", () => {
     expect(store.getState().message?.text).toBe("nothing to copy");
   });
 
-  it("reports the copy through the status message", async () => {
+  it("reports the copy through the status message, naming the separator mode", async () => {
     const store = await makeSelStore();
     store.setCursorIndex(indexOf(store, "f5.txt"));
     store.pathClipboardText("newline");
     expect(store.getState().message?.text).toBe(
-      "1 path copied to the system clipboard",
+      "1 path copied to the system clipboard (one per line)",
+    );
+  });
+
+  it("names the space-separated mode in the status message", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f5.txt"));
+    store.pathClipboardText("space");
+    expect(store.getState().message?.text).toBe(
+      "1 path copied to the system clipboard (space-separated)",
     );
   });
 

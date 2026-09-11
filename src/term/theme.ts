@@ -18,6 +18,7 @@
 // each read as visually distinct at a glance.
 
 import type { Entry } from "../fsapi/entry.ts";
+import type { GitStatus } from "../fsapi/gitStatus.ts";
 
 // ── colors ──
 
@@ -55,6 +56,10 @@ export const colors = {
   marked: 0xf6c945,
   cut: 0xff8c42,
   copied: 0xa78bfa,
+  // Git status marker colors (see `gitStatusColor` below) — green for a
+  // clean repo, orange for a dirty one.
+  gitClean: 0x8ce99a,
+  gitDirty: 0xffa94d,
 } as const;
 
 // ── file categorisation ──
@@ -278,8 +283,50 @@ export function markColor(state: RowMarkState): number | undefined {
 // The suffix appended to a directory's displayed name when its path is a
 // goto bookmark (fsapi/goto.ts) — the breadcrumb (ui/chrome.ts) and both
 // list/grid rows (ui/listView.ts/ui/gridView.ts) all share this one glyph
-// and color, same "plain Unicode chrome, not gated by --icons" precedent as
-// the breadcrumb's `›`/`…` (see ui/overlay/help.ts's file header).
+// and color. Deliberately an emoji (not gated by --icons), so it renders
+// in its own color regardless of `bookmarkColor` below.
 
-export const BOOKMARK_GLYPH = " ★";
+export const BOOKMARK_GLYPH = " ⭐";
 export const bookmarkColor = colors.accent;
+
+// ── git status markers ──
+//
+// A directory that is itself a git repo root (fsapi/gitStatus.ts's
+// `isGitRepoRoot`) gets a small suffix appended after its name, same
+// position as `BOOKMARK_GLYPH` above — but drawn with `gitStatusColor()`
+// below rather than the row's own color, so a clean repo's `✓` reads green
+// and a dirty one's `✗<n>` reads orange. Dirty vs. clean is still carried
+// primarily by the glyph's *shape* (✓ vs ✗ plus a count), so it survives
+// `--no-color` and any `--icons` set exactly like the cursor's `›` — color
+// is a bonus for a real terminal, never the only signal, same reasoning as
+// `cursorBg` (see ui/listView.ts's file header). ui/listView.ts and
+// ui/gridView.ts only split the suffix into its own colored `screen.put`
+// when truncation leaves it fully intact; a suffix clipped by a narrow
+// column falls back to rendering in the row's plain color.
+
+const GIT_STATUS_CAP = 99;
+
+/**
+ * `""` for every "no marker" case at once — `status` is `null`/`undefined`
+ * because the directory isn't a repo, `git` is missing, or (most commonly)
+ * its background check just hasn't resolved yet. A count past
+ * `GIT_STATUS_CAP` renders as `99+` rather than growing the column
+ * unboundedly for a repo with thousands of changed paths.
+ */
+export function gitStatusSuffix(status: GitStatus | null | undefined): string {
+  if (!status) return "";
+  if (!status.dirty) return " ✓";
+  const n =
+    status.changes > GIT_STATUS_CAP
+      ? `${GIT_STATUS_CAP}+`
+      : String(status.changes);
+  return ` ✗${n}`;
+}
+
+/** Color for `gitStatusSuffix()`'s glyph — `undefined` (no marker) mirrors `""`. */
+export function gitStatusColor(
+  status: GitStatus | null | undefined,
+): number | undefined {
+  if (!status) return undefined;
+  return status.dirty ? colors.gitDirty : colors.gitClean;
+}

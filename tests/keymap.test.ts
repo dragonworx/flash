@@ -81,20 +81,20 @@ describe("resolveAction: Phase 4 bindings", () => {
     expect(action).toEqual({ type: "copyPath", separator: "newline" });
   });
 
-  it("Ctrl+Alt+C copies paths space-separated", () => {
-    const action = resolveAction(
-      makeKey({ name: "c", ctrl: true, alt: true }),
-      makeState(),
-    );
+  it("Shift+C copies paths space-separated", () => {
+    const action = resolveAction(makeKey({ name: "C" }), makeState());
     expect(action).toEqual({ type: "copyPath", separator: "space" });
+  });
+
+  it("Ctrl+Alt+C is not the space-separated binding", () => {
+    expect(
+      resolveAction(makeKey({ name: "c", ctrl: true, alt: true }), makeState()),
+    ).toBeNull();
   });
 
   it("other ctrl/alt combinations remain no-ops", () => {
     expect(
       resolveAction(makeKey({ name: "x", ctrl: true }), makeState()),
-    ).toBeNull();
-    expect(
-      resolveAction(makeKey({ name: "c", alt: true }), makeState()),
     ).toBeNull();
   });
 
@@ -107,8 +107,8 @@ describe("resolveAction: Phase 4 bindings", () => {
     });
   });
 
-  it("~ jumps to the home directory", () => {
-    expect(resolveAction(makeKey({ name: "~" }), makeState())).toEqual({
+  it("` jumps to the home directory", () => {
+    expect(resolveAction(makeKey({ name: "`" }), makeState())).toEqual({
       type: "goHome",
     });
   });

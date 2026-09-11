@@ -335,9 +335,10 @@ function draw(screen: Screen): void {
     } else if (state.view === "grid") {
       const entries = store.visibleEntries();
       const bookmarks = store.bookmarkedPaths();
+      const gitStatuses = store.gitStatuses();
       const layout = computeGridLayout(
         w,
-        entries.map((e) => entryDisplayWidth(e, bookmarks)),
+        entries.map((e) => entryDisplayWidth(e, bookmarks, gitStatuses)),
       );
       const rows = gridRowCount(entries.length, layout.columns);
       const cursorRow = layout.columns > 0 ? state.cursor % rows : 0;
@@ -359,7 +360,8 @@ function draw(screen: Screen): void {
         iconSet,
         state.marked,
         state.clipboard,
-        store.bookmarkedPaths(),
+        bookmarks,
+        gitStatuses,
       );
     } else if (listLayout !== null) {
       store.ensureVisible(frame.listHeight);
@@ -380,6 +382,7 @@ function draw(screen: Screen): void {
         Date.now(),
         store.dirSizes(),
         store.bookmarkedPaths(),
+        store.gitStatuses(),
       );
     }
   }
@@ -609,9 +612,10 @@ function handleNavigate(dir: "up" | "down" | "left" | "right"): void {
 
   const entries = store.visibleEntries();
   const bookmarks = store.bookmarkedPaths();
+  const gitStatuses = store.gitStatuses();
   const layout = computeGridLayout(
     Math.max(screen.columns, 1),
-    entries.map((e) => entryDisplayWidth(e, bookmarks)),
+    entries.map((e) => entryDisplayWidth(e, bookmarks, gitStatuses)),
   );
   if (layout.columns === 0) return;
   const rows = gridRowCount(entries.length, layout.columns);

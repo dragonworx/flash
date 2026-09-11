@@ -10,6 +10,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Entry } from "../src/fsapi/entry.ts";
 import { Screen } from "../src/term/screen.ts";
+import { colors } from "../src/term/theme.ts";
 import type { ColumnKey } from "../src/ui/listView.ts";
 import {
   COLUMN_WIDTH,
@@ -406,6 +407,127 @@ describe("selection & clipboard status rendering", () => {
     const copyOut = copyScreen.flush();
     expect(copyOut.match(sgrRe)).toContain(`${ESC}[0;2m`);
     expect(copyOut).not.toContain(`${ESC}[0;2;3m`);
+  });
+});
+
+describe("git status marker", () => {
+  const layout = computeListLayout(100);
+
+  it("appends a clean checkmark after a clean git repo's name", () => {
+    const screen = new Screen(100, 1, () => {});
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      gitStatuses,
+    );
+    expect(firstLine(screen)).toContain("my-repo ✓");
+  });
+
+  it("appends a dirty marker with the change count after a dirty repo's name", () => {
+    const screen = new Screen(100, 1, () => {});
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: true, changes: 7 }]]);
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      gitStatuses,
+    );
+    expect(firstLine(screen)).toContain("my-repo ✗7");
+  });
+
+  it("shows no marker for a directory with no cached git status", () => {
+    const screen = new Screen(100, 1, () => {});
+    const entry = makeEntry("plain-dir", { kind: "dir" });
+    renderListView(screen, 0, 0, 100, 1, [entry], -1, 0, layout, "ascii");
+    const line = firstLine(screen);
+    expect(line).not.toContain("✓");
+    expect(line).not.toContain("✗");
+  });
+
+  function sgrFor(color: number): string {
+    return `${ESC}[0;38;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  }
+
+  it("colors a clean repo's checkmark green", () => {
+    const screen = new Screen(100, 1, () => {});
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      gitStatuses,
+    );
+    const out = screen.flush();
+    expect(out).toContain(sgrFor(colors.gitClean));
+    expect(out).not.toContain(sgrFor(colors.gitDirty));
+  });
+
+  it("colors a dirty repo's marker orange", () => {
+    const screen = new Screen(100, 1, () => {});
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: true, changes: 7 }]]);
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      gitStatuses,
+    );
+    const out = screen.flush();
+    expect(out).toContain(sgrFor(colors.gitDirty));
+    expect(out).not.toContain(sgrFor(colors.gitClean));
   });
 });
 

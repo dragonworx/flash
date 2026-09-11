@@ -53,7 +53,7 @@ describe("formatBreadcrumb", () => {
 
   it("appends the bookmark star to cwd's own segment when bookmarked", () => {
     expect(formatBreadcrumb("/home/dev/fs", 80, null, true)).toBe(
-      "/ › home › dev › fs ★",
+      "/ › home › dev › fs ⭐",
     );
   });
 

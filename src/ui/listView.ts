@@ -48,6 +48,7 @@
 
 import { formatMode, formatMtime, formatSize } from "../fsapi/entry.ts";
 import type { Entry } from "../fsapi/entry.ts";
+import type { GitStatus } from "../fsapi/gitStatus.ts";
 import { groupName, userName } from "../fsapi/users.ts";
 import {
   ATTR_DIM,
@@ -61,11 +62,13 @@ import {
   MARK_GLYPH,
   colorFor,
   colors,
+  gitStatusColor,
+  gitStatusSuffix,
   iconFor,
   markColor,
   rowMarkState,
 } from "../term/theme.ts";
-import { pad, truncate } from "../term/width.ts";
+import { pad, stringWidth, truncate } from "../term/width.ts";
 
 /** Structural, not imported from state/store.ts — see the file header. */
 type ClipboardLike = { mode: "copy" | "cut"; paths: string[] } | null;
@@ -115,6 +118,8 @@ const EMPTY_MARKED: ReadonlySet<string> = new Set();
 const EMPTY_DIR_SIZES: ReadonlyMap<string, number> = new Map();
 // Same reasoning, for callers that don't care about goto bookmarks.
 const EMPTY_BOOKMARKS: ReadonlySet<string> = new Set();
+// Same reasoning, for callers that don't care about git status markers.
+const EMPTY_GIT_STATUSES: ReadonlyMap<string, GitStatus | null> = new Map();
 
 function fixedCost(columns: ColumnKey[]): number {
   return (
@@ -253,6 +258,7 @@ function renderRow(
   clipboard: ClipboardLike,
   dirSizes: ReadonlyMap<string, number>,
   bookmarks: ReadonlySet<string>,
+  gitStatuses: ReadonlyMap<string, GitStatus | null>,
 ): void {
   const bg = isCursor ? colors.cursorBg : undefined;
   const fg = colorFor(entry);
@@ -291,15 +297,38 @@ function renderRow(
   // The synthetic ".." row never carries the bookmark star either — see the
   // ".." mark-glyph note above; the breadcrumb's own star already covers
   // "the directory I'm in right now is bookmarked."
-  const displayName =
-    entry.name !== ".." && bookmarks.has(entry.path)
-      ? `${entry.name}${BOOKMARK_GLYPH}`
-      : entry.name;
-  screen.put(x + nameX, y, pad(truncate(displayName, nameWidth), nameWidth), {
-    ...rowStyle,
-    fg,
-    attr: contentAttr,
-  });
+  const bookmarkSuffix =
+    entry.name !== ".." && bookmarks.has(entry.path) ? BOOKMARK_GLYPH : "";
+  const gitStatus = entry.name !== ".." ? gitStatuses.get(entry.path) : null;
+  const gitSuffix = gitStatusSuffix(gitStatus);
+  const displayName = `${entry.name}${bookmarkSuffix}${gitSuffix}`;
+  const truncated = truncate(displayName, nameWidth);
+  // Color the git suffix on its own (see term/theme.ts's `gitStatusColor`)
+  // only when truncation left it fully intact — a suffix clipped by a
+  // narrow column falls back to the row's plain color below.
+  if (gitSuffix && truncated.endsWith(gitSuffix)) {
+    const basePart = truncated.slice(0, truncated.length - gitSuffix.length);
+    screen.put(x + nameX, y, basePart, { ...rowStyle, fg, attr: contentAttr });
+    screen.put(x + nameX + stringWidth(basePart), y, gitSuffix, {
+      ...rowStyle,
+      fg: gitStatusColor(gitStatus),
+      attr: contentAttr,
+    });
+    const usedWidth = stringWidth(truncated);
+    if (usedWidth < nameWidth) {
+      screen.put(x + nameX + usedWidth, y, " ".repeat(nameWidth - usedWidth), {
+        ...rowStyle,
+        fg,
+        attr: contentAttr,
+      });
+    }
+  } else {
+    screen.put(x + nameX, y, pad(truncated, nameWidth), {
+      ...rowStyle,
+      fg,
+      attr: contentAttr,
+    });
+  }
 
   if (entry.error) {
     const usedWidth = nameX + nameWidth;
@@ -351,6 +380,7 @@ export function renderListView(
   now: number = Date.now(),
   dirSizes: ReadonlyMap<string, number> = EMPTY_DIR_SIZES,
   bookmarks: ReadonlySet<string> = EMPTY_BOOKMARKS,
+  gitStatuses: ReadonlyMap<string, GitStatus | null> = EMPTY_GIT_STATUSES,
 ): void {
   if (width <= 0 || height <= 0) return;
   for (let row = 0; row < height; row++) {
@@ -371,6 +401,7 @@ export function renderListView(
       clipboard,
       dirSizes,
       bookmarks,
+      gitStatuses,
     );
   }
 }

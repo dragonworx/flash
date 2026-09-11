@@ -6,6 +6,7 @@
 import { describe, expect, it } from "bun:test";
 import type { Entry } from "../src/fsapi/entry.ts";
 import { Screen } from "../src/term/screen.ts";
+import { colors } from "../src/term/theme.ts";
 import {
   clampGridScroll,
   computeGridLayout,
@@ -33,7 +34,7 @@ function makeEntry(name: string, overrides: Partial<Entry> = {}): Entry {
 describe("entryDisplayWidth", () => {
   it("adds the bookmark star's width for a bookmarked entry", () => {
     const entry = makeEntry("arena-engine", { width: 12 });
-    expect(entryDisplayWidth(entry, new Set(["/tmp/arena-engine"]))).toBe(14);
+    expect(entryDisplayWidth(entry, new Set(["/tmp/arena-engine"]))).toBe(15);
   });
 
   it("leaves an entry's width alone when it isn't bookmarked", () => {
@@ -44,6 +45,40 @@ describe("entryDisplayWidth", () => {
   it("never stars the synthetic '..' row, even if its path is bookmarked", () => {
     const entry = makeEntry("..", { path: "/tmp/parent", width: 2 });
     expect(entryDisplayWidth(entry, new Set(["/tmp/parent"]))).toBe(2);
+  });
+
+  it("adds the clean git marker's width for a git repo with no changes", () => {
+    const entry = makeEntry("my-repo", { width: 7, kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    // " ✓" is 2 columns wide.
+    expect(entryDisplayWidth(entry, new Set(), gitStatuses)).toBe(9);
+  });
+
+  it("adds the dirty git marker's width, including its change count", () => {
+    const entry = makeEntry("my-repo", { width: 7, kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: true, changes: 3 }]]);
+    // " ✗3" is 3 columns wide.
+    expect(entryDisplayWidth(entry, new Set(), gitStatuses)).toBe(10);
+  });
+
+  it("adds no width for a directory with no cached git status yet", () => {
+    const entry = makeEntry("my-repo", { width: 7, kind: "dir" });
+    expect(entryDisplayWidth(entry, new Set(), new Map())).toBe(7);
+  });
+
+  it("never marks the synthetic '..' row, even if its path has a cached status", () => {
+    const entry = makeEntry("..", { path: "/tmp/parent", width: 2 });
+    const gitStatuses = new Map([["/tmp/parent", { dirty: true, changes: 5 }]]);
+    expect(entryDisplayWidth(entry, new Set(), gitStatuses)).toBe(2);
+  });
+
+  it("stacks the bookmark star and the git marker together", () => {
+    const entry = makeEntry("my-repo", { width: 7, kind: "dir" });
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    // 7 (name) + 3 (star) + 2 (clean marker) = 12.
+    expect(entryDisplayWidth(entry, new Set([entry.path]), gitStatuses)).toBe(
+      12,
+    );
   });
 });
 
@@ -296,5 +331,113 @@ describe("renderGridView: selection & clipboard status", () => {
     const screen = new Screen(40, 2, () => {});
     renderGridView(screen, 0, 0, 40, 1, [entry], -1, 0, "ascii");
     expect(firstLine(screen)[1]).toBe(" ");
+  });
+});
+
+describe("renderGridView: git status marker", () => {
+  it("appends a clean checkmark after a clean git repo's name", () => {
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const screen = new Screen(40, 1, () => {});
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      null,
+      new Set(),
+      gitStatuses,
+    );
+    expect(firstLine(screen)).toContain("my-repo ✓");
+  });
+
+  it("appends a dirty marker with the change count after a dirty repo's name", () => {
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const screen = new Screen(40, 1, () => {});
+    const gitStatuses = new Map([[entry.path, { dirty: true, changes: 4 }]]);
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      null,
+      new Set(),
+      gitStatuses,
+    );
+    expect(firstLine(screen)).toContain("my-repo ✗4");
+  });
+
+  it("shows no marker for a directory not in the git status map", () => {
+    const entry = makeEntry("plain-dir", { kind: "dir" });
+    const screen = new Screen(40, 1, () => {});
+    renderGridView(screen, 0, 0, 40, 1, [entry], -1, 0, "ascii");
+    const line = firstLine(screen);
+    expect(line).not.toContain("✓");
+    expect(line).not.toContain("✗");
+  });
+
+  const ESC = "\x1b";
+  function sgrFor(color: number): string {
+    return `${ESC}[0;38;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  }
+
+  it("colors a clean repo's checkmark green", () => {
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const screen = new Screen(40, 1, () => {});
+    const gitStatuses = new Map([[entry.path, { dirty: false, changes: 0 }]]);
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      null,
+      new Set(),
+      gitStatuses,
+    );
+    const out = screen.flush();
+    expect(out).toContain(sgrFor(colors.gitClean));
+    expect(out).not.toContain(sgrFor(colors.gitDirty));
+  });
+
+  it("colors a dirty repo's marker orange", () => {
+    const entry = makeEntry("my-repo", { kind: "dir" });
+    const screen = new Screen(40, 1, () => {});
+    const gitStatuses = new Map([[entry.path, { dirty: true, changes: 4 }]]);
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      null,
+      new Set(),
+      gitStatuses,
+    );
+    const out = screen.flush();
+    expect(out).toContain(sgrFor(colors.gitDirty));
+    expect(out).not.toContain(sgrFor(colors.gitClean));
   });
 });
