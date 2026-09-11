@@ -1,6 +1,6 @@
 {
   "name": "flash-tui",
-  "version": "0.1.0",
+  "version": "1.0.1",
   "type": "module",
   "private": true,
   "description": "flash — a full-screen, keyboard-driven terminal file manager",
@@ -22,6 +22,7 @@
     "lint": "bunx biome check src/ tests/",
     "lint:fix": "bunx biome check --write src/ tests/",
     "clean": "rm -rf dist",
+    "bump": "bunx bumpp --no-push",
     "reset": "stty sane; printf '\\e[?1049l\\e[?25h\\e[0m'"
   },
   "dependencies": {
