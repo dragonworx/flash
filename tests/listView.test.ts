@@ -531,6 +531,91 @@ describe("git status marker", () => {
   });
 });
 
+describe("'/' quick filter: matched-name highlight", () => {
+  const layout = computeListLayout(100);
+
+  // Plain files carry no foreground color of their own (colorFor returns
+  // undefined), so the highlighted run's SGR code is exactly "background,
+  // no foreground" — the simplest possible signature to assert against.
+  function bgSgrFor(color: number): string {
+    return `${ESC}[0;48;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  }
+
+  function renderWithQuery(entry: Entry, query: string | null): string {
+    const screen = new Screen(100, 1, () => {});
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [entry],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      new Map(),
+      query,
+    );
+    return screen.flush();
+  }
+
+  it("highlights the matched run with the filter-match background", () => {
+    const entry = makeEntry("report-final.pdf");
+    const out = renderWithQuery(entry, "final");
+    expect(out).toContain(bgSgrFor(colors.matchHighlight));
+  });
+
+  it("does nothing when there's no active query", () => {
+    const entry = makeEntry("report-final.pdf");
+    const out = renderWithQuery(entry, null);
+    expect(out).not.toContain(bgSgrFor(colors.matchHighlight));
+  });
+
+  it("does nothing when the query doesn't occur in the name", () => {
+    const entry = makeEntry("report-final.pdf");
+    const out = renderWithQuery(entry, "zzz");
+    expect(out).not.toContain(bgSgrFor(colors.matchHighlight));
+  });
+
+  it("is case-insensitive, matching the same rule Store.visibleEntries uses", () => {
+    const entry = makeEntry("report-final.pdf");
+    const out = renderWithQuery(entry, "FINAL");
+    expect(out).toContain(bgSgrFor(colors.matchHighlight));
+  });
+
+  it("never highlights the synthetic '..' row even if the query matches its literal dots", () => {
+    const screen = new Screen(100, 1, () => {});
+    const parent = makeEntry("..", { path: "/tmp" });
+    renderListView(
+      screen,
+      0,
+      0,
+      100,
+      1,
+      [parent],
+      -1,
+      0,
+      layout,
+      "ascii",
+      new Set(),
+      null,
+      Date.now(),
+      new Map(),
+      new Set(),
+      new Map(),
+      ".",
+    );
+    const out = screen.flush();
+    expect(out).not.toContain(bgSgrFor(colors.matchHighlight));
+  });
+});
+
 describe("no dot leader", () => {
   it("fills the gap after a short name with plain whitespace, not a leader glyph", () => {
     const width = 100;

@@ -441,3 +441,56 @@ describe("renderGridView: git status marker", () => {
     expect(out).not.toContain(sgrFor(colors.gitClean));
   });
 });
+
+describe("renderGridView: '/' quick filter matched-name highlight", () => {
+  const ESC = "\x1b";
+
+  // Same reasoning as ui/listView.ts's equivalent test: a plain file has no
+  // foreground color of its own, so the highlighted run's SGR is exactly
+  // "background, no foreground."
+  function bgSgrFor(color: number): string {
+    return `${ESC}[0;48;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  }
+
+  function renderWithQuery(entry: Entry, query: string | null): string {
+    const screen = new Screen(40, 1, () => {});
+    renderGridView(
+      screen,
+      0,
+      0,
+      40,
+      1,
+      [entry],
+      -1,
+      0,
+      "ascii",
+      new Set(),
+      null,
+      new Set(),
+      new Map(),
+      query,
+    );
+    return screen.flush();
+  }
+
+  it("highlights the matched run with the filter-match background", () => {
+    const entry = makeEntry("report-final.pdf");
+    expect(renderWithQuery(entry, "final")).toContain(
+      bgSgrFor(colors.matchHighlight),
+    );
+  });
+
+  it("does nothing when there's no active query", () => {
+    const entry = makeEntry("report-final.pdf");
+    expect(renderWithQuery(entry, null)).not.toContain(
+      bgSgrFor(colors.matchHighlight),
+    );
+  });
+
+  it("never highlights the synthetic '..' row", () => {
+    const parent = makeEntry("..", { path: "/tmp" });
+    expect(renderWithQuery(parent, ".")).not.toContain(
+      bgSgrFor(colors.matchHighlight),
+    );
+  });
+});
