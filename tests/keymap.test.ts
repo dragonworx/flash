@@ -73,12 +73,20 @@ describe("resolveAction: Phase 4 bindings", () => {
     expect(action).toEqual({ type: "markAll" });
   });
 
-  it("Ctrl+C still quits — Ctrl+A is a narrow addition, not a general ctrl passthrough", () => {
+  it("Ctrl+C copies paths to the system clipboard — q is the sole quit key", () => {
     const action = resolveAction(
       makeKey({ name: "c", ctrl: true }),
       makeState(),
     );
-    expect(action).toEqual({ type: "quit" });
+    expect(action).toEqual({ type: "copyPath", separator: "newline" });
+  });
+
+  it("Ctrl+Alt+C copies paths space-separated", () => {
+    const action = resolveAction(
+      makeKey({ name: "c", ctrl: true, alt: true }),
+      makeState(),
+    );
+    expect(action).toEqual({ type: "copyPath", separator: "space" });
   });
 
   it("other ctrl/alt combinations remain no-ops", () => {
@@ -96,6 +104,18 @@ describe("resolveAction: Phase 4 bindings", () => {
     });
     expect(resolveAction(makeKey({ name: "x" }), makeState())).toEqual({
       type: "cut",
+    });
+  });
+
+  it("~ jumps to the home directory", () => {
+    expect(resolveAction(makeKey({ name: "~" }), makeState())).toEqual({
+      type: "goHome",
+    });
+  });
+
+  it("only q quits", () => {
+    expect(resolveAction(makeKey({ name: "q" }), makeState())).toEqual({
+      type: "quit",
     });
   });
 });
@@ -123,12 +143,12 @@ describe("resolveEscape precedence", () => {
     expect(resolveEscape(state)).toEqual({ type: "clearMarks" });
   });
 
-  it("leaves a staged copy alone and goes up (arm 4) — copy isn't destructive", () => {
+  it("clears a staged copy too, even with no marks (arm 2)", () => {
     const state = makeState({
       marked: new Set(),
       clipboard: { mode: "copy", paths: ["/tmp/somewhere/a.txt"] },
     });
-    expect(resolveEscape(state)).toEqual({ type: "up" });
+    expect(resolveEscape(state)).toEqual({ type: "clearMarks" });
   });
 
   it("resolveAction('escape') routes through the same precedence table", () => {

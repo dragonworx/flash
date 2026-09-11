@@ -28,6 +28,27 @@ export function setTitle(title: string): string {
   return `${OSC}0;${title}${ST}`;
 }
 
+/**
+ * OSC 52: set the *local* clipboard to `text` (base64-encoded UTF-8 payload,
+ * per the spec). This is the only clipboard mechanism that works on a
+ * headless server: the sequence travels back over SSH like any other output
+ * and the terminal emulator on the *client* machine intercepts it and writes
+ * its own clipboard — nothing runs on the server beyond this one write.
+ * Terminals that don't support OSC 52 (or have it disabled) silently ignore
+ * it, so emitting it is always safe; `xclip`/`xsel`/`wl-copy` are
+ * deliberately not tried — there is no X11/Wayland on the servers this
+ * targets, and shelling out would break the zero-runtime-dependency rule.
+ */
+export function setClipboard(text: string): string {
+  const payload = Buffer.from(text, "utf8").toString("base64");
+  return `${OSC}52;c;${payload}${ST}`;
+}
+
+/** Emit `setClipboard(text)` directly to stdout — the other side effect in this file. */
+export function copyTextToClipboard(text: string): void {
+  process.stdout.write(setClipboard(text));
+}
+
 /** Emit both for `path` directly to stdout — the one side effect in this file. */
 export function announceDirectory(path: string): void {
   process.stdout.write(reportCwd(path) + setTitle(`flash — ${path}`));

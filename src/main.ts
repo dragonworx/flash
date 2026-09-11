@@ -656,6 +656,11 @@ input.onKey((key: Key) => {
     case "up":
       store.up().catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
+    case "goHome":
+      store
+        .goHome()
+        .catch((err) => store.setMessage(errorMessage(err), "error"));
+      break;
     case "toggleView":
       store.toggleView();
       persistConfig();
@@ -717,6 +722,15 @@ input.onKey((key: Key) => {
         .paste()
         .catch((err) => store.setMessage(errorMessage(err), "error"));
       break;
+    case "copyPath": {
+      // The Store prepares the joined path text (and reports it through the
+      // status bar); the OSC 52 write itself lives here, on the stdout-
+      // touching side of the Store/renderer split, same as
+      // `osc.announceDirectory` in the subscribe block above.
+      const text = store.pathClipboardText(action.separator);
+      if (text !== null) osc.copyTextToClipboard(text);
+      break;
+    }
     case "clearMarks":
       store.clearMarks();
       break;

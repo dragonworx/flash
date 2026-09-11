@@ -17,7 +17,7 @@ import {
   rmSync,
   writeFileSync,
 } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { Store } from "../src/state/store.ts";
 
@@ -416,14 +416,14 @@ describe("Store.clearMarks", () => {
     expect(store.getState().clipboard).toBeNull();
   });
 
-  it("leaves a staged copy alone", async () => {
+  it("clears a staged copy too, so the first Escape never navigates while anything is selected", async () => {
     const store = await makeSelStore();
     store.markAll();
     store.copy();
     expect(store.getState().clipboard?.mode).toBe("copy");
     store.clearMarks();
     expect(store.getState().marked.size).toBe(0);
-    expect(store.getState().clipboard?.mode).toBe("copy");
+    expect(store.getState().clipboard).toBeNull();
   });
 });
 
@@ -479,6 +479,76 @@ describe("Store clipboard (copy/cut)", () => {
     store.moveCursorTo("home"); // the ".." row
     store.copy();
     expect(store.getState().clipboard).toBeNull();
+  });
+});
+
+describe("Store.pathClipboardText (Ctrl+C / Ctrl+Alt+C)", () => {
+  it("joins the marked set one path per line for the newline separator", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f1.txt"));
+    store.extendSelection("down"); // marks f1, f2
+    const text = store.pathClipboardText("newline");
+    expect(text).not.toBeNull();
+    const lines = text?.split("\n") ?? [];
+    expect(lines).toHaveLength(2);
+    expect(lines).toContain(
+      store.visibleEntries()[indexOf(store, "f1.txt")]?.path ?? "",
+    );
+    expect(lines).toContain(
+      store.visibleEntries()[indexOf(store, "f2.txt")]?.path ?? "",
+    );
+  });
+
+  it("joins on a single space for the space separator", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f1.txt"));
+    store.extendSelection("down"); // marks f1, f2
+    const text = store.pathClipboardText("space");
+    expect(text).not.toBeNull();
+    expect(text).not.toContain("\n");
+    expect(text?.split(" ")).toHaveLength(2);
+  });
+
+  it("falls back to the entry under the cursor when nothing is marked", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f5.txt"));
+    const f5path = store.visibleEntries()[indexOf(store, "f5.txt")]?.path ?? "";
+    expect(store.pathClipboardText("newline")).toBe(f5path);
+  });
+
+  it("returns null on the synthetic '..' row with nothing marked", async () => {
+    const store = await makeSelStore();
+    store.moveCursorTo("home"); // the ".." row
+    expect(store.pathClipboardText("newline")).toBeNull();
+    expect(store.getState().message?.text).toBe("nothing to copy");
+  });
+
+  it("reports the copy through the status message", async () => {
+    const store = await makeSelStore();
+    store.setCursorIndex(indexOf(store, "f5.txt"));
+    store.pathClipboardText("newline");
+    expect(store.getState().message?.text).toBe(
+      "1 path copied to the system clipboard",
+    );
+  });
+
+  it("shortens paths under the user's home directory to a ~/ prefix", async () => {
+    const store = await makeSelStore();
+    // Marked paths are joined verbatim (no existence check), so synthetic
+    // paths under the real home dir exercise the shortening without any
+    // fixture needing to live there. Bun's `os.homedir()` ignores a
+    // runtime-mutated $HOME, so faking home via env is not an option.
+    store.getState().marked.add(join(homedir(), "alpha.txt"));
+    store.getState().marked.add(join(homedir(), "beta.txt"));
+    expect(store.pathClipboardText("newline")).toBe("~/alpha.txt\n~/beta.txt");
+  });
+});
+
+describe("Store.goHome", () => {
+  it("navigates to the user's home directory", async () => {
+    const store = await makeSelStore();
+    await store.goHome();
+    expect(store.getState().cwd).toBe(homedir());
   });
 });
 

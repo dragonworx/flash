@@ -6,19 +6,22 @@
 // nothing has to be cross-referenced against `main.ts` to know what a key
 // does.
 //
-// Escape has three jobs per the plan, resolved in strict precedence order,
-// first match wins:
+// Escape has four jobs, resolved in strict precedence order, first match
+// wins:
 //   1. An overlay is open -> close it.
-//   2. Marks exist, or a cut is staged -> clear marks and cancel the cut.
+//   2. Marks exist, or a copy/cut is staged -> clear marks and the clipboard.
 //   3. Browsing an archive at its root -> leave the archive.
 //   4. Otherwise -> go up one directory.
-// Arm 2 only cancels a *cut* clipboard, not a *copy* one — a staged copy is
-// non-destructive and expected to survive navigation to wherever you mean to
-// paste it (h/Backspace/← still go up regardless of Escape's state, so nothing
-// is stranded). A staged cut gets the same "deselect" treatment as marks
-// because `rowMarkState` (term/theme.ts) checks the clipboard before `marked`
-// — clearing only `marked` would leave a lone cut entry (no prior mark, e.g.
-// cut via the cursor with nothing selected) showing its "x" glyph forever.
+// Arm 2 treats a staged clipboard exactly like marks: the first Escape
+// clears the selection and the path stays put; only an Escape pressed with
+// nothing selected goes up. A staged cut needs this because `rowMarkState`
+// (term/theme.ts) checks the clipboard before `marked` — clearing only
+// `marked` would leave a lone cut entry (no prior mark, e.g. cut via the
+// cursor with nothing selected) showing its "x" glyph forever — and a staged
+// copy gets the same treatment so Escape's "clear first, navigate second"
+// contract doesn't depend on how the selection was staged. Navigating up
+// with a clipboard staged still works via h/Backspace/←, which bypass this
+// table entirely, so copy -> navigate -> paste is unaffected.
 // All four arms are reachable as of Phase 8: Phase 5a's progress overlay and
 // Phase 7's prompt/confirm/permissions overlays all set `state.overlay`;
 // marks have been real since Phase 4; arm 3 (`isArchiveRoot`, below) is real
@@ -51,6 +54,9 @@ export type Action =
   | { type: "navigate"; dir: "up" | "down" | "left" | "right" }
   | { type: "enter" }
   | { type: "up" }
+  // `~`: jump straight to the user's home directory — a real navigation,
+  // same as picking a bookmark (state/store.ts's `goHome`).
+  | { type: "goHome" }
   | { type: "toggleView" }
   | { type: "toggleHidden" }
   | { type: "cycleSort" }
@@ -80,7 +86,18 @@ export type Action =
   // Targets the current directory and consumes `AppState.clipboard` — see
   // state/store.ts's `paste()`.
   | { type: "paste" }
-  // Escape-precedence arms. `clearMarks` is live as of Phase 4.
+  // Ctrl+C copies the selected entries' full paths to the *system* clipboard
+  // (via OSC 52 — see term/osc.ts's `setClipboard`), distinct from `c`,
+  // which stages files in flash's own internal clipboard for `p` to paste.
+  // `separator` picks the multi-select format: one path per line, or —
+  // with Ctrl+Alt+C — a single space-separated line. This takes Ctrl+C away
+  // from "quit" (`q` remains the quit key), a deliberate trade: the OSC 52
+  // path-copy is the only feature here that needs a Ctrl key anyway, since
+  // every letter is already spoken for.
+  | { type: "copyPath"; separator: "newline" | "space" }
+  // Escape-precedence arms. `clearMarks` clears every mark and any staged
+  // clipboard (copy *or* cut) — see the file header for why a copy gets the
+  // same treatment as a cut.
   // `closeOverlay` becomes live in Phase 5a too — the paste progress
   // overlay is the first real `AppState.overlay` value, so arm 1 below is
   // no longer only theoretical (see main.ts's handling of it: it cancels an
@@ -195,6 +212,10 @@ function plainArrow(name: string): (key: Key) => boolean {
 
 function withCtrl(name: string): (key: Key) => boolean {
   return (key: Key) => key.ctrl && !key.alt && key.name === name;
+}
+
+function withCtrlAlt(name: string): (key: Key) => boolean {
+  return (key: Key) => key.ctrl && key.alt && key.name === name;
 }
 
 function shiftArrow(name: "up" | "down"): (key: Key) => boolean {
@@ -321,6 +342,13 @@ export const BINDINGS: KeyBinding[] = [
     matches: bare("b"),
     action: () => ({ type: "startBookmarks" }),
   },
+  {
+    display: ["~"],
+    description: "Jump to your home directory",
+    category: "navigation",
+    matches: bare("~"),
+    action: () => ({ type: "goHome" }),
+  },
 
   // ── file operations ──
   {
@@ -343,6 +371,21 @@ export const BINDINGS: KeyBinding[] = [
     category: "file operations",
     matches: bare("p"),
     action: () => ({ type: "paste" }),
+  },
+  {
+    display: ["Ctrl+C"],
+    description:
+      "Copy the selected entries' full paths to the system clipboard (one per line)",
+    category: "file operations",
+    matches: withCtrl("c"),
+    action: () => ({ type: "copyPath", separator: "newline" }),
+  },
+  {
+    display: ["Ctrl+Alt+C"],
+    description: "Same as Ctrl+C, but as a single space-separated line",
+    category: "file operations",
+    matches: withCtrlAlt("c"),
+    action: () => ({ type: "copyPath", separator: "space" }),
   },
   {
     display: ["r"],
@@ -428,10 +471,13 @@ export const BINDINGS: KeyBinding[] = [
     action: () => ({ type: "help" }),
   },
   {
-    display: ["q", "Ctrl+C"],
+    // Ctrl+C used to quit here too; it now copies paths to the system
+    // clipboard instead (see the `copyPath` Action's comment), leaving `q`
+    // as the sole quit key.
+    display: ["q"],
     description: "Quit flash",
     category: "app",
-    matches: (key) => bare("q")(key) || withCtrl("c")(key),
+    matches: bare("q"),
     action: () => ({ type: "quit" }),
   },
 ];
@@ -449,7 +495,7 @@ export const ESCAPE_HELP: {
   category: BindingCategory;
 } = {
   display: ["Esc"],
-  description: "Close overlay > clear marks/cut > leave archive > go up",
+  description: "Close overlay > clear marks/clipboard > leave archive > go up",
   category: "navigation",
 };
 
@@ -464,9 +510,7 @@ function isArchiveRoot(state: AppState): boolean {
 const ESCAPE_PRECEDENCE: EscapeGuard[] = [
   (s) => (s.overlay ? { type: "closeOverlay" } : null),
   (s) =>
-    s.marked.size > 0 || s.clipboard?.mode === "cut"
-      ? { type: "clearMarks" }
-      : null,
+    s.marked.size > 0 || s.clipboard !== null ? { type: "clearMarks" } : null,
   (s) => (isArchiveRoot(s) ? { type: "leaveArchive" } : null),
   () => ({ type: "up" }),
 ];

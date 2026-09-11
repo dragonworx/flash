@@ -85,6 +85,7 @@
 
 import { lstatSync } from "node:fs";
 import { rename as fsRename, lstat, readdir } from "node:fs/promises";
+import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import {
   type ArchiveTree,
@@ -799,6 +800,18 @@ export class Store {
     await this.load(parent);
   }
 
+  /**
+   * `~` (keymap.ts's `goHome` action): jump straight to the user's home
+   * directory — a real navigation via `load()`, same as walking there by
+   * hand or picking a bookmark (see `selectBookmark`), so cwd/
+   * OSC-announce/watcher-retarget all follow along for free. From inside
+   * an archive this leaves the archive entirely, the same way a bookmark
+   * jump does.
+   */
+  async goHome(): Promise<void> {
+    await this.load(homedir());
+  }
+
   private archiveUp(): void {
     const archive = this.state.archive;
     if (!archive) return;
@@ -1015,22 +1028,23 @@ export class Store {
   }
 
   /**
-   * Clear every mark and cancel a staged cut — Escape's second-precedence
-   * arm when marks exist or a cut is pending. A staged *copy* is left
-   * alone: it's non-destructive and meant to survive navigation to
-   * wherever the user pastes it. See keymap.ts's `ESCAPE_PRECEDENCE`
-   * comment for why a cut needs the same treatment as marks — `rowMarkState`
-   * checks the clipboard before `marked`, so a cut with no prior mark (the
-   * cursor-only fallback) would otherwise keep showing its "x" glyph after
-   * marks are cleared.
+   * Clear every mark and any staged clipboard (copy *or* cut) — Escape's
+   * second-precedence arm when marks exist or a clipboard is staged. The
+   * path stays put; only an Escape pressed with nothing selected goes up.
+   * See keymap.ts's `ESCAPE_PRECEDENCE` comment for why a cut needs the
+   * same treatment as marks (`rowMarkState` checks the clipboard before
+   * `marked`), and why a staged copy is cleared too: Escape's "clear
+   * first, navigate second" contract doesn't depend on how the selection
+   * was staged, and h/Backspace/← still go up with a clipboard staged, so
+   * copy -> navigate -> paste keeps working.
    */
   clearMarks(): void {
     const hadMarks = this.state.marked.size > 0;
-    const hadCut = this.state.clipboard?.mode === "cut";
-    if (!hadMarks && !hadCut) return;
+    const hadClipboard = this.state.clipboard !== null;
+    if (!hadMarks && !hadClipboard) return;
     this.state.marked.clear();
     this.resetRangeAnchor();
-    if (hadCut) this.state.clipboard = null;
+    if (hadClipboard) this.state.clipboard = null;
     this.notify();
   }
 
@@ -1110,6 +1124,32 @@ export class Store {
     const entry = list[this.state.cursor];
     if (!entry || entry.name === "..") return [];
     return [entry.path];
+  }
+
+  /**
+   * The text Ctrl+C/Ctrl+Alt+C (`copyPath`, keymap.ts) puts on the *system*
+   * clipboard: the marked set's — or, when nothing is marked, the cursor
+   * entry's — full paths, same fallback as `stageClipboard`. Paths inside
+   * the user's home directory are shortened to a `~/` prefix (and home
+   * itself to `~`) — see `shortenHomePath` below. Joined one per
+   * line, or space-separated for `separator: "space"`. Returns `null` when
+   * there is nothing to copy (and, like `stageClipboard`, refuses inside an
+   * archive — an entry's `path` there is zip-internal, not something a user
+   * could meaningfully paste into a shell). The actual OSC 52 write happens
+   * in main.ts via term/osc.ts's `copyTextToClipboard` — this file never
+   * touches stdout (see the file header), it only prepares the payload and
+   * reports what happened through the status message.
+   */
+  pathClipboardText(separator: "newline" | "space"): string | null {
+    if (this.refuseInsideArchive()) return null;
+    const paths = this.clipboardCandidatePaths();
+    if (paths.length === 0) {
+      this.setMessage("nothing to copy");
+      return null;
+    }
+    const label = paths.length === 1 ? "1 path" : `${paths.length} paths`;
+    this.setMessage(`${label} copied to the system clipboard`);
+    return paths.map(shortenHomePath).join(separator === "space" ? " " : "\n");
   }
 
   /** A directory (or a symlink to one) — the entries `dirSizeCache` prices. */
@@ -2325,6 +2365,19 @@ export class Store {
 /** `err.message` for an `Error`, `String(err)` otherwise — same small helper main.ts keeps for the same reason. */
 function errorMessage(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * `~` for the user's home directory itself, `~/rest` for a path inside it,
+ * the path unchanged otherwise. Applied to the text `pathClipboardText`
+ * puts on the system clipboard — the display paths elsewhere (header,
+ * rows) keep their full form; only the copy-path payload is shortened.
+ */
+function shortenHomePath(path: string): string {
+  const home = homedir();
+  if (path === home) return "~";
+  if (path.startsWith(`${home}/`)) return `~${path.slice(home.length)}`;
+  return path;
 }
 
 /**
