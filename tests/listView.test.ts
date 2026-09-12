@@ -534,11 +534,17 @@ describe("git status marker", () => {
 describe("'/' quick filter: matched-name highlight", () => {
   const layout = computeListLayout(100);
 
-  // Plain files carry no foreground color of their own (colorFor returns
-  // undefined), so the highlighted run's SGR code is exactly "background,
-  // no foreground" — the simplest possible signature to assert against.
-  function bgSgrFor(color: number): string {
-    return `${ESC}[0;48;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  // The matched run always carries both `colors.matchHighlight` as its
+  // background and `colors.matchHighlightFg` (white) as its foreground,
+  // overriding the row's own file-type color (or lack of one) — this
+  // builds the exact combined SGR code screen.ts's `sgrFor` emits for that
+  // pair, fg before bg.
+  function bgSgrFor(bg: number): string {
+    const fg = colors.matchHighlightFg;
+    return (
+      `${ESC}[0;38;2;${(fg >> 16) & 0xff};${(fg >> 8) & 0xff};${fg & 0xff}` +
+      `;48;2;${(bg >> 16) & 0xff};${(bg >> 8) & 0xff};${bg & 0xff}m`
+    );
   }
 
   function renderWithQuery(entry: Entry, query: string | null): string {

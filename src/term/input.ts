@@ -26,6 +26,17 @@
 // lone escape after an input timeout, i.e. the host multiplexer already
 // delays escapes in flight — 50ms leaves room for that rather than racing
 // it (an earlier 25ms budget did not).
+//
+// `ESC ]` (OSC) is the odd one out: unlike every CSI/SS3 sequence above,
+// this codebase also *sends* an OSC query it expects a reply to
+// (term/bgColor.ts's OSC 11 background-color query, re-sent periodically by
+// main.ts so a terminal theme switch mid-session is picked up) — so a reply
+// arriving here is expected traffic, not noise. `consumeOSC` recognizes it
+// and dispatches a `bgColor` event; any other OSC content (an unsolicited
+// one from the terminal, or garbage) is discarded the same as an
+// unrecognized CSI, never surfaced as a phantom keypress.
+
+import { parseBackgroundReply } from "./bgColor.ts";
 
 export type Key = {
   name: string;
@@ -35,7 +46,10 @@ export type Key = {
   raw: string;
 };
 
-type Event = { kind: "key"; key: Key } | { kind: "focus"; focused: boolean };
+type Event =
+  | { kind: "key"; key: Key }
+  | { kind: "focus"; focused: boolean }
+  | { kind: "bgColor"; color: number };
 
 /** A parse step consumed `length` bytes; `event` is null for a discard. */
 type Consumed = { length: number; event: Event | null };
@@ -223,6 +237,30 @@ function consumeCSI(buf: string): ParseOutcome {
   return INCOMPLETE;
 }
 
+/**
+ * Scan for an OSC sequence's terminator (BEL, or ESC `\`), same
+ * "incomplete until we see it" shape as `consumeCSI`'s scan for a final
+ * byte. An OSC with no recognized payload (i.e. not a background-color
+ * reply) is discarded whole rather than surfaced.
+ */
+function consumeOSC(buf: string): ParseOutcome {
+  // buf[0] = ESC, buf[1] = "]"
+  for (let i = 2; i < buf.length; i++) {
+    const code = buf.charCodeAt(i);
+    if (code === 0x07) return oscToEvent(buf.slice(0, i + 1));
+    if (code === ESC && buf[i + 1] === "\\")
+      return oscToEvent(buf.slice(0, i + 2));
+  }
+  return INCOMPLETE;
+}
+
+function oscToEvent(raw: string): Consumed {
+  const color = parseBackgroundReply(raw);
+  if (color !== null)
+    return { length: raw.length, event: { kind: "bgColor", color } };
+  return { length: raw.length, event: null };
+}
+
 function consumeSS3(buf: string): ParseOutcome {
   // buf[0] = ESC, buf[1] = "O"
   if (buf.length < 3) return INCOMPLETE;
@@ -247,6 +285,7 @@ function consumeOne(buf: string): ParseOutcome {
   const c1 = buf[1];
   if (c1 === "[") return consumeCSI(buf);
   if (c1 === "O") return consumeSS3(buf);
+  if (c1 === "]") return consumeOSC(buf);
 
   // ESC followed by anything else: the common terminal convention for
   // Alt+<key>.
@@ -268,6 +307,7 @@ export class Input {
   private escTimer: ReturnType<typeof setTimeout> | null = null;
   private keyHandlers: Array<(key: Key) => void> = [];
   private focusHandlers: Array<(focused: boolean) => void> = [];
+  private bgColorHandlers: Array<(color: number) => void> = [];
   private stdin: NodeJS.ReadableStream;
   private listening = false;
   private readonly handleData = (chunk: Buffer | string) => this.feed(chunk);
@@ -282,6 +322,10 @@ export class Input {
 
   onFocus(cb: (focused: boolean) => void): void {
     this.focusHandlers.push(cb);
+  }
+
+  onBgColor(cb: (color: number) => void): void {
+    this.bgColorHandlers.push(cb);
   }
 
   start(): void {
@@ -351,8 +395,10 @@ export class Input {
   private dispatch(event: Event): void {
     if (event.kind === "key") {
       for (const cb of this.keyHandlers) cb(event.key);
-    } else {
+    } else if (event.kind === "focus") {
       for (const cb of this.focusHandlers) cb(event.focused);
+    } else {
+      for (const cb of this.bgColorHandlers) cb(event.color);
     }
   }
 }

@@ -7,9 +7,11 @@ function collect() {
   const input = new Input();
   const keys: Key[] = [];
   const focus: boolean[] = [];
+  const bgColors: number[] = [];
   input.onKey((k) => keys.push(k));
   input.onFocus((f) => focus.push(f));
-  return { input, keys, focus };
+  input.onBgColor((c) => bgColors.push(c));
+  return { input, keys, focus, bgColors };
 }
 
 describe("Input: plain keys", () => {
@@ -108,6 +110,29 @@ describe("Input: focus events", () => {
     input.feed("\x1b[I\x1b[O");
     expect(keys).toEqual([]);
     expect(focus).toEqual([true, false]);
+  });
+});
+
+describe("Input: OSC background-color replies", () => {
+  it("emits a bgColor event for a BEL-terminated OSC 11 reply, not a keypress", () => {
+    const { input, keys, bgColors } = collect();
+    input.feed("\x1b]11;rgb:1e1e/1e1e/2b2b\x07");
+    expect(keys).toEqual([]);
+    expect(bgColors).toEqual([0x1e1e2b]);
+  });
+
+  it("emits a bgColor event for an ST-terminated OSC 11 reply", () => {
+    const { input, keys, bgColors } = collect();
+    input.feed("\x1b]11;rgb:ffff/ffff/ffff\x1b\\");
+    expect(keys).toEqual([]);
+    expect(bgColors).toEqual([0xffffff]);
+  });
+
+  it("discards an unrelated OSC sequence instead of emitting a phantom key", () => {
+    const { input, keys, bgColors } = collect();
+    input.feed("\x1b]0;window title\x07q");
+    expect(bgColors).toEqual([]);
+    expect(keys.map((k) => k.name)).toEqual(["q"]);
   });
 });
 

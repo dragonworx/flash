@@ -1,21 +1,20 @@
 # Flash
 
-**Terminal file management, reimagined for speed.**
+**Your file manager should be as fast as you think. This one is.**
 
-Most file managers make you wait — for a mouse to move, for a window to
-redraw, for a spinner to finish. `flash` doesn't. It's a full-screen,
-keyboard-driven terminal file manager built to react the instant you press a
-key: navigate, multi-select, copy/cut/paste with conflict resolution and a
-live progress bar, rename, mkdir, delete, edit permissions, preview text
-files in place, and browse zip archives as if they were folders — all
-rendered as a list or a grid with icons, sizes, permissions, owner/group,
-and modified time, and all kept live as files change underneath it. No
-mouse support, on purpose: your terminal's own click-drag text selection
-keeps working inside a `flash` pane. Point it at a directory and move at
-the speed of thought.
+`flash` is a full-screen, keyboard-driven terminal file manager. Every key
+lands the instant you press it — no spinner, no redraw lag, no mouse to
+reach for. Navigate, multi-select, copy/cut/paste with conflict resolution
+and a live progress bar, rename, mkdir, delete, chmod, preview text files in
+place, and browse zip archives like folders. List or grid, icons, sizes,
+permissions, owner/group, modified time — all live-updated as files change
+underneath you.
 
-Below is a quick tour — install it in under a minute, then skim the
-keybindings so nothing surprises you once you're in.
+No mouse support. Not a gap — a decision: your terminal's native
+click-drag text selection keeps working inside a `flash` pane.
+
+Install in under a minute. Skim the keybindings below so nothing surprises
+you once you're in.
 
 ```
 ┌──────────────────────────────────────────────────────────────────────────────────────────┐
@@ -35,74 +34,60 @@ keybindings so nothing surprises you once you're in.
 7 items
 ```
 
-(That's a real render — `bun run src/main.ts --dump-frame --no-color --size 92x24 -d src`,
-which renders exactly one frame as plain text and exits. No PTY required; it's how this
-project catches layout regressions in CI instead of squinting at a live terminal.)
+*(That's a real render, not a mockup — `bun run src/main.ts --dump-frame
+--no-color --size 92x24 -d src` renders one frame as plain text and exits.
+No PTY needed, which is exactly how this project catches layout regressions
+in CI instead of squinting at a live terminal.)*
 
-`flash` also works well as a panel inside `herdr` or tmux: it reads
-its size from the pty (not `$COLUMNS`/`$LINES`), announces the current directory via OSC 7
-and the window title via OSC 0, coalesces repaints while its pane is unfocused, and wraps
-every frame in synchronized-output escapes so a multiplexer never tears mid-repaint.
+Plays nicely as a panel inside `herdr` or tmux, too: reads its size from the
+pty, announces cwd via OSC 7 and title via OSC 0, coalesces repaints while
+unfocused, and wraps every frame in synchronized-output escapes so your
+multiplexer never tears mid-repaint.
 
 ## Install
 
 **Clone and run** (needs [Bun](https://bun.sh) ≥ 1.3):
 
 ```sh
-curl -fsSL https://bun.sh/install | bash   # skip this if `bun --version` already prints ≥ 1.3
+curl -fsSL https://bun.sh/install | bash   # skip if `bun --version` already prints ≥ 1.3
 git clone <repo-url> flash && cd flash
 bun install
 bun run start                # or: bun run src/main.ts -d ~/some/directory
 ```
 
-**npm** (package name `flash-tui` — the bare name `flash` was already taken):
+**npm** (package name `flash-tui` — `flash` was taken):
 
 ```sh
 npm install -g flash-tui
 flash
 ```
 
-This package isn't published yet. Until then, build and link it locally to get the same
-result: `bun run build && npm link` (from the repo root), which installs the `flash` command
-from the Node-compatible `dist/flash.js` build described below.
+Not published yet. Until then: `bun run build && npm link` gets you the
+same `flash` command, running from `dist/flash.js`.
 
-**Standalone binary** (no Bun or Node required on the target machine):
+**Standalone binary** (no Bun or Node needed on the target machine):
 
 ```sh
 bun run build:binary         # dist/flash — see build.ts
 ./dist/flash
 ```
 
-**Install it system-wide** — `bun mount` builds the binary and drops it on your PATH
-in one step:
+**One step, on your PATH:**
 
 ```sh
 bun mount                    # -> ~/.local/bin/flash
-flash                        # now works from anywhere
+flash                        # works from anywhere now
 bun unmount                  # removes it again
 ```
 
-It installs to `~/.local/bin` by default, creating that directory if needed. Override
-with `FLASH_BIN_DIR`:
+Installs to `~/.local/bin` by default (override with `FLASH_BIN_DIR`, e.g.
+`FLASH_BIN_DIR=/usr/local/bin sudo -E bun mount` for all users). It's a
+*copy* — `git pull` won't update it, re-run `bun mount` after pulling. Want
+it to track your working tree instead? Use `bun run build && npm link`.
 
-```sh
-FLASH_BIN_DIR=/usr/local/bin sudo -E bun mount   # all users on the machine
-```
-
-Note that this installs a *copy*, so `git pull` will not update the mounted command —
-re-run `bun mount` after pulling. If you would rather the command track your working
-tree, use `bun run build && npm link` instead, which installs a shim pointing at
-`dist/flash.js`; that one needs Node at runtime and is tied to whichever Node version
-was active when you linked it.
-
-Expect roughly 95 MB on linux-x64 and 63 MB on darwin-arm64 (measured: 91 MiB / 61 MiB) —
-that's an embedded Bun runtime, not a bug, and the app's own code barely moves it.
-`bun run build:binary -- --minify` is the only lever worth pulling (`build.ts` deliberately
-does *not* add `--bytecode`: verified on this machine, it fails to compile this codebase at
-all, since `--bytecode` doesn't support the top-level `await` in `src/main.ts`).
-`build.ts` documents why cross-compiling (`--target=bun-linux-x64` / `--target=bun-darwin-arm64`,
-also wired up as `bun run build:binary:linux-x64` / `:darwin-arm64`) needs network access
-the first time it runs — both were verified working from this machine.
+Roughly 95 MB on linux-x64 / 63 MB on darwin-arm64 — that's an embedded Bun
+runtime, not bloat from `flash` itself. `--minify` is the only lever worth
+pulling.
 
 ## Usage
 
@@ -116,17 +101,17 @@ flash [-d|--dir <path>]      directory to open; defaults to the current director
       [--help] [--version]
 ```
 
-Anything settable by a flag is also readable from the config file (below), with flags
-winning for that run. Sort order, view mode, and hidden-file visibility are written back to
-the config file whenever you change them in-app.
+Every flag is also a config-file setting (below), with flags winning for
+that run. Sort order, view mode, and hidden-file visibility get written
+back to the config file whenever you change them in-app.
 
 ## Keybindings
 
-Press `?` inside flash for the full, always-up-to-date list — it's generated directly from
-the same table this section is transcribed from, so it can never drift from what a key
-actually does. `Esc` is context-sensitive: it closes an open overlay, else clears marks,
-else leaves an archive at its root, else goes up a directory (first match wins). `←`, `h`,
-and `Backspace` always go up, regardless of state.
+Press `?` inside flash for the full, always-current list — generated
+straight from the same table below, so it can never drift from what a key
+actually does. `Esc` is context-sensitive: closes an overlay › clears marks
+› leaves an archive › goes up a directory (first match wins). `←`, `h`, and
+`Backspace` always go up.
 
 | Keys | Action |
 | --- | --- |
@@ -164,38 +149,35 @@ and `Backspace` always go up, regardless of state.
 
 ### File preview
 
-`Enter`/`Space`/`l` on a regular text file opens a near-full-screen preview, scrollable
-in place without leaving `flash`. It pipes the file through [`bat`](https://github.com/sharkdp/bat)
-for syntax highlighting when `bat` is on `PATH`, falling back to plain `cat` otherwise —
-either way it's a real subprocess, so binary-file detection, themes, and highlighting all
-come from `bat` itself rather than being reimplemented in `flash`. Directories, archives,
-and device/socket/fifo entries never go through preview; `Enter` on those opens or enters
-them as usual.
+`Enter`/`Space`/`l` on a text file opens a near-full-screen, scrollable
+preview without ever leaving `flash`. It shells out to
+[`bat`](https://github.com/sharkdp/bat) for syntax highlighting when
+available, falling back to plain `cat` — real subprocess, real highlighting,
+zero reimplemented logic. Directories, archives, and device/socket/fifo
+entries just open or enter as usual.
 
-### Goto bookmarks
+### Goto bookmarks — and why you want `goto` too
 
-`flash` reads (never writes) the bookmark list kept by
-[`goto`](https://github.com/dragonworx/goto), a separate directory-jump shell tool. If
-`goto` is set up on your machine, `b` opens a scrollable picker listing every bookmark in
-the same most-recently-used order `goto`'s own interactive picker uses; `Enter`/`Space`
-jumps the file view straight to the selected path, and `Esc` or `b` again closes it without
-navigating. Any directory currently open that happens to be one of those bookmarks gets a
-`★` after its name — in the breadcrumb, and on its row in the list/grid view when it appears
-as a child entry.
+Press `b` and jump straight to any bookmark from
+[`goto`](https://github.com/dragonworx/goto), the directory-jump shell tool
+that ends `cd ../../../projects/thing-i-forgot-the-path-to` forever. `flash`
+reads goto's bookmark file (never writes it), re-reading it live so a
+bookmark added or removed in another terminal shows up immediately — no
+restart. Bookmarked directories get a `★` wherever they appear, in the
+breadcrumb and in the file list.
 
-Bookmarks are re-read from disk on every navigation and whenever `b` opens the picker, so a
-bookmark added, renamed, or removed with `goto -a`/`-r`/`-d` in another terminal shows up
-without restarting `flash`. It looks for goto's config at `$GOTO_HOME` (however goto's own
-shell wrapper set it for your session), falling back to `~/.goto` — the same default goto
-itself uses. Nothing changes here if you don't use `goto`: a missing or empty bookmark file
-just means `b` reports "no goto bookmarks found" and the `★` never shows.
+Don't have `goto` installed? You're missing half the reason this feature is
+good. It's a tiny, fast, no-dependency way to name a directory once and
+warp back to it from any shell, forever — pair it with `flash`'s `b` picker
+and you stop typing `cd` altogether. Nothing breaks if you skip it: `b`
+just reports no bookmarks found.
 
 ## Config file
 
-`$XDG_CONFIG_HOME/flash/config.json`, falling back to `~/.config/flash/config.json`. Written
-atomically (temp file + rename) whenever you change view mode, sort order, or hidden-file
-visibility in-app; a missing or corrupt file is never fatal — flash falls back to defaults,
-per field if needed. Shape:
+`$XDG_CONFIG_HOME/flash/config.json`, falling back to `~/.config/flash/config.json`.
+Written atomically whenever you change view mode, sort order, or hidden-file
+visibility in-app. Missing or corrupt file? Never fatal — falls back to
+defaults, per field.
 
 ```json
 {
@@ -206,35 +188,31 @@ per field if needed. Shape:
 }
 ```
 
-`sort.key` is one of `name` | `size` | `mtime` | `extension`. `icons` is one of `unicode`
-(default) | `nerd` (Nerd Font glyphs) | `ascii` (plain ASCII glyphs, for terminals or
-captured logs that can't render extended characters at all — independent of color, which
-`--no-color`/`NO_COLOR` control separately).
+`sort.key`: `name` | `size` | `mtime` | `extension`. `icons`: `unicode`
+(default) | `nerd` (Nerd Font glyphs) | `ascii` (plain glyphs for terminals
+that can't render extended characters).
 
 ## My terminal is broken
 
-If flash (or anything that crashed while it had the terminal in raw mode / the alternate
-screen buffer) leaves your shell looking wrong — invisible cursor, garbled input, a dead
-screen — run:
+If flash (or anything that grabbed raw mode / the alternate screen buffer)
+crashed and left your shell looking wrong, run:
 
 ```sh
 stty sane; printf '\e[?1049l\e[?25h'
 ```
 
-or, from inside the repo, `bun run reset`, which does the same thing plus a full SGR reset.
-This should never be necessary — flash installs crash guards on `SIGTERM`/`SIGHUP`/
-`SIGQUIT`/`SIGINT`/`uncaughtException`/`unhandledRejection` that restore the terminal before
-exiting — but `SIGKILL` is unrecoverable by definition, and this is the escape hatch for it.
+or `bun run reset` from inside the repo (same fix, plus a full SGR reset).
+This should never be necessary — flash installs crash guards on every
+signal it can catch — but `SIGKILL` is unrecoverable by definition, and this
+is the escape hatch for it.
 
 ## Known limitations
 
-- **No single-member copy out of an archive via the clipboard.** `copy`/`cut` refuse while
-  browsing inside a `.zip` (there's nothing on the clipboard's other end that would make
-  sense for a partial extraction); `u` (extract the whole archive into the current
-  directory) is the supported way to get contents out today. This is a deliberate,
-  recorded gap, not an oversight.
-- **Zip only.** No `.tar`/`.tar.gz`/`.7z`/etc. browsing — see `SPEC.md` and the plan for why
-  (`fflate` has no native `.tar` support, and shelling out to system tools was ruled out for
-  a self-contained binary). Read-only `.tar.gz` listing is a plausible follow-up.
-- **No ZIP64, no encrypted zips** (a `fflate` limitation): archives over 4 GB or with more
-  than 65,535 entries, or password-protected zips, aren't supported.
+- **No single-member copy out of an archive.** `copy`/`cut` refuse inside a
+  `.zip`; `u` (extract the whole archive) is the supported way out today.
+  Deliberate, not an oversight.
+- **Zip only** — no `.tar`/`.tar.gz`/`.7z` browsing yet. See `SPEC.md` and
+  the plan for why (`fflate` has no native `.tar` support). Read-only
+  `.tar.gz` listing is a plausible follow-up.
+- **No ZIP64, no encrypted zips** (an `fflate` limitation) — archives over
+  4 GB, over 65,535 entries, or password-protected, aren't supported.

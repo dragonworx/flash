@@ -61,12 +61,67 @@ export const colors = {
   gitClean: 0x8ce99a,
   gitDirty: 0xffa94d,
   // The `/` quick filter's matched-substring highlight (see
-  // `filterMatchSpan` below) — a background color, not a foreground one,
-  // so it reads as "this is the part that matched" without fighting the
-  // row's own file-type foreground color (dir blue, executable green,
-  // ...), which stays exactly as it was everywhere else on the row.
+  // `filterMatchSpan` below): a background band plus a fixed white
+  // foreground for the matched run itself, deliberately overriding the
+  // row's own file-type foreground color (dir blue, executable green, ...)
+  // there so the match always reads clearly against `matchHighlight`
+  // regardless of what color the row would otherwise use.
   matchHighlight: 0x2b6e3f,
-} as const;
+  matchHighlightFg: 0xffffff,
+};
+
+// ── adaptive backgrounds ──
+//
+// `cursorBg`/`footerBg` above are just the dark-terminal defaults now —
+// main.ts calls `setDetectedBackground` once at startup, fed by
+// `term/bgColor.ts`'s OSC 11 query, so a light terminal doesn't end up with
+// a nearly-invisible dark-blue-on-white highlight. Terminals that never
+// answer the query (no OSC 11 support, or a multiplexer that swallows it —
+// the common case) leave the literals above untouched.
+
+function relativeLuminance(rgb: number): number {
+  const r = (rgb >> 16) & 0xff;
+  const g = (rgb >> 8) & 0xff;
+  const b = rgb & 0xff;
+  return (0.299 * r + 0.587 * g + 0.114 * b) / 255;
+}
+
+function mix(base: number, toward: number, amount: number): number {
+  const br = (base >> 16) & 0xff;
+  const bg = (base >> 8) & 0xff;
+  const bb = base & 0xff;
+  const tr = (toward >> 16) & 0xff;
+  const tg = (toward >> 8) & 0xff;
+  const tb = toward & 0xff;
+  const r = Math.round(br + (tr - br) * amount);
+  const g = Math.round(bg + (tg - bg) * amount);
+  const b = Math.round(bb + (tb - bb) * amount);
+  return (r << 16) | (g << 8) | b;
+}
+
+const LUMINANCE_THRESHOLD = 0.5;
+// The cursor row gets more contrast than the footer strip so the two read
+// as related but distinct — the same relationship as the dark-terminal
+// literals above (`0x243447` vs `0x1b2430`: cursorBg is the lighter one).
+const CURSOR_BLEND = 0.16;
+const FOOTER_BLEND = 0.09;
+
+/**
+ * Replace `cursorBg`/`footerBg` with shades derived from the terminal's
+ * actual background (`bg`, a packed 0xRRGGBB truecolor value, or `null` when
+ * the terminal never answered the OSC 11 query — see `term/bgColor.ts`).
+ * Blends toward black for a light background and toward white for a dark
+ * one, so the result is "medium-light"/"medium-dark" relative to whatever
+ * exact shade the terminal actually is, rather than a fixed pair of colors
+ * that only look right against one specific background.
+ */
+export function setDetectedBackground(bg: number | null): void {
+  if (bg === null) return;
+  const isLight = relativeLuminance(bg) > LUMINANCE_THRESHOLD;
+  const toward = isLight ? 0x000000 : 0xffffff;
+  colors.cursorBg = mix(bg, toward, CURSOR_BLEND);
+  colors.footerBg = mix(bg, toward, FOOTER_BLEND);
+}
 
 // ── file categorisation ──
 

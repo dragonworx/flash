@@ -151,12 +151,13 @@ export type ViewMode = "list" | "grid";
 export type Message = { text: string; kind: "info" | "error" };
 
 /**
- * `"help"` (Phase 9): `startHelp()`/`closeHelp()`/`helpScroll()` below own
- * it. `scrollOffset` is a line count into `ui/overlay/help.ts`'s generated,
- * flattened `HELP_LINES` — it lives on the overlay object rather than as a
- * bare local in main.ts (the way the grid view's scroll offset does)
- * because, like the permissions overlay's `focus` field, it's directly
- * user-driven by its own dedicated keys rather than derived every frame
+ * `"help"` (Phase 9): `startHelp()`/`closeHelp()`/`helpScroll()`/`helpTab()`
+ * below own it. `scrollOffset` is a line count into the active tab's lines
+ * in `ui/overlay/help.ts`'s generated `HELP_TABS`; `tab` is an index into
+ * that same array. Both live on the overlay object rather than as bare
+ * locals in main.ts (the way the grid view's scroll offset does) because,
+ * like the permissions overlay's `focus` field, they're directly
+ * user-driven by their own dedicated keys rather than derived every frame
  * from the cursor. `"progress"` is real as of Phase 5a: `paste()` below
  * sets it for the duration of a copy and the render loop (main.ts's
  * `draw()`) paints it via `ui/overlay/progress.ts`. Its shape matches
@@ -165,7 +166,7 @@ export type Message = { text: string; kind: "info" | "error" };
  * translation layer.
  */
 export type Overlay =
-  | { kind: "help"; scrollOffset: number }
+  | { kind: "help"; scrollOffset: number; tab: number }
   | {
       kind: "progress";
       label: string;
@@ -2430,7 +2431,7 @@ export class Store {
    */
   startHelp(): void {
     if (this.state.overlay) return;
-    this.state.overlay = { kind: "help", scrollOffset: 0 };
+    this.state.overlay = { kind: "help", scrollOffset: 0, tab: 0 };
     this.notify();
   }
 
@@ -2442,10 +2443,29 @@ export class Store {
   }
 
   /**
+   * ←/→ (see keymap.ts's `resolveHelpKey`): switch the active category tab,
+   * wrapping past either end, and reset scroll to the top — a scroll
+   * position from the old tab's content wouldn't mean anything against the
+   * new one's, generally shorter or longer, list of bindings. `tabCount` is
+   * `ui/overlay/help.ts`'s `HELP_TABS.length`, passed in by the caller
+   * (main.ts) rather than imported here, same reason `helpScroll` below
+   * takes its clamp bound from the caller: this file stays free of a
+   * dependency on the render-side module.
+   */
+  helpTab(delta: number, tabCount: number): void {
+    const overlay = this.state.overlay;
+    if (!overlay || overlay.kind !== "help") return;
+    const n = Math.max(tabCount, 1);
+    overlay.tab = (((overlay.tab + delta) % n) + n) % n;
+    overlay.scrollOffset = 0;
+    this.notify();
+  }
+
+  /**
    * Move the help overlay's scroll position by `delta` lines, clamped to
    * `[0, maxScrollOffset]`. `maxScrollOffset` is computed by the caller
    * (main.ts, via `ui/overlay/help.ts`'s `maxHelpScroll`) from the terminal
-   * size and the generated content's line count — the same
+   * size and the active tab's own line count — the same
    * runtime-geometry-computed-by-the-caller pattern `pageMove` already uses
    * for `frame.listHeight`, and for the same reason: this file has no
    * access to the terminal width/height `Screen` was constructed with.

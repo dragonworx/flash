@@ -445,11 +445,16 @@ describe("renderGridView: git status marker", () => {
 describe("renderGridView: '/' quick filter matched-name highlight", () => {
   const ESC = "\x1b";
 
-  // Same reasoning as ui/listView.ts's equivalent test: a plain file has no
-  // foreground color of its own, so the highlighted run's SGR is exactly
-  // "background, no foreground."
-  function bgSgrFor(color: number): string {
-    return `${ESC}[0;48;2;${(color >> 16) & 0xff};${(color >> 8) & 0xff};${color & 0xff}m`;
+  // Same reasoning as ui/listView.ts's equivalent test: the matched run
+  // always carries both `colors.matchHighlight` as its background and
+  // `colors.matchHighlightFg` (white) as its foreground, overriding the
+  // row's own file-type color (or lack of one).
+  function bgSgrFor(bg: number): string {
+    const fg = colors.matchHighlightFg;
+    return (
+      `${ESC}[0;38;2;${(fg >> 16) & 0xff};${(fg >> 8) & 0xff};${fg & 0xff}` +
+      `;48;2;${(bg >> 16) & 0xff};${(bg >> 8) & 0xff};${bg & 0xff}m`
+    );
   }
 
   function renderWithQuery(entry: Entry, query: string | null): string {

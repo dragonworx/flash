@@ -75,6 +75,10 @@ export type Action =
   // is a line count, with Home/End sending an oversized delta that
   // `Store.helpScroll`'s clamp reduces to "jump to the very top/bottom."
   | { type: "helpScroll"; delta: number }
+  // ←/→ while the help overlay is open: switch the active category tab.
+  // `delta` is ±1 — `Store.helpTab`'s wraparound (see state/store.ts) is
+  // what turns that into "previous/next, cycling past either end."
+  | { type: "helpTab"; delta: number }
   // The text preview overlay (Enter on a plain file — see
   // state/store.ts's `startPreview`). `previewScroll` only ever fires
   // while `state.overlay?.kind === "preview"` (see `resolvePreviewKey`
@@ -698,10 +702,10 @@ const HELP_SCROLL_JUMP = 1_000_000;
 /**
  * The `?` help overlay captures every key except Escape (handled
  * unconditionally before this ever runs, same as every other overlay) —
- * scrolling keys move it, `?` toggles it closed again (a help screen that
- * only Escape can dismiss is a common enough paper cut to avoid for free),
- * and everything else is swallowed rather than leaking through to
- * copy/cut/delete/etc. running behind it.
+ * scrolling keys move it, ←/→ switch the active category tab, `?` toggles
+ * it closed again (a help screen that only Escape can dismiss is a common
+ * enough paper cut to avoid for free), and everything else is swallowed
+ * rather than leaking through to copy/cut/delete/etc. running behind it.
  */
 function resolveHelpKey(key: Key): Action | null {
   if (key.ctrl || key.alt) return null;
@@ -720,6 +724,10 @@ function resolveHelpKey(key: Key): Action | null {
       return { type: "helpScroll", delta: -HELP_SCROLL_JUMP };
     case "end":
       return { type: "helpScroll", delta: HELP_SCROLL_JUMP };
+    case "left":
+      return { type: "helpTab", delta: -1 };
+    case "right":
+      return { type: "helpTab", delta: 1 };
     case "?":
       return { type: "closeOverlay" };
     default:

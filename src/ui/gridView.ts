@@ -218,10 +218,11 @@ export function clampGridScroll(
 /**
  * Draw `text` at `(x, y)`, highlighting `match` (JS string indices into
  * `text`, already clamped to `text`'s own length by the caller) with
- * `colors.matchHighlight` instead of `style.bg` — same helper, same
- * reasoning, as ui/listView.ts's `putNameRun`. Returns the column width
- * actually used (unpadded) for the same reason: the caller still has its
- * own gitSuffix/padding to place after this.
+ * `colors.matchHighlight`/`colors.matchHighlightFg` instead of `style.bg`/
+ * `style.fg` — same helper, same reasoning, as ui/listView.ts's
+ * `putNameRun`. Returns the column width actually used (unpadded) for the
+ * same reason: the caller still has its own gitSuffix/padding to place
+ * after this.
  */
 function putNameRun(
   screen: Screen,
@@ -244,7 +245,11 @@ function putNameRun(
     cx += stringWidth(before);
   }
   if (hit) {
-    screen.put(cx, y, hit, { ...style, bg: colors.matchHighlight });
+    screen.put(cx, y, hit, {
+      ...style,
+      bg: colors.matchHighlight,
+      fg: colors.matchHighlightFg,
+    });
     cx += stringWidth(hit);
   }
   if (after) {

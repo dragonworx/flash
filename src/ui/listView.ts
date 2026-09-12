@@ -248,13 +248,14 @@ export function renderListHeader(
 /**
  * Draw `text` at `(x, y)`, highlighting `match` (JS string indices into
  * `text`, already clamped to `text`'s own length by the caller) with
- * `colors.matchHighlight` instead of `style.bg`, everything else in
- * `style` unchanged — the `/` quick filter's "here's what matched" cue
- * (see term/theme.ts's `filterMatchSpan`). Returns the column width
- * actually used, not padded: the gitSuffix-split branch below still needs
- * to place its own suffix right after this, and the plain branch pads the
- * remainder itself — same "caller pads, this just draws" split the
- * gitSuffix code already used for its own two-part `screen.put` pair.
+ * `colors.matchHighlight`/`colors.matchHighlightFg` instead of `style.bg`/
+ * `style.fg`, everything else in `style` unchanged — the `/` quick filter's
+ * "here's what matched" cue (see term/theme.ts's `filterMatchSpan`).
+ * Returns the column width actually used, not padded: the gitSuffix-split
+ * branch below still needs to place its own suffix right after this, and
+ * the plain branch pads the remainder itself — same "caller pads, this just
+ * draws" split the gitSuffix code already used for its own two-part
+ * `screen.put` pair.
  */
 function putNameRun(
   screen: Screen,
@@ -277,7 +278,11 @@ function putNameRun(
     cx += stringWidth(before);
   }
   if (hit) {
-    screen.put(cx, y, hit, { ...style, bg: colors.matchHighlight });
+    screen.put(cx, y, hit, {
+      ...style,
+      bg: colors.matchHighlight,
+      fg: colors.matchHighlightFg,
+    });
     cx += stringWidth(hit);
   }
   if (after) {

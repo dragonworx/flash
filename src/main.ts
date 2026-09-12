@@ -38,11 +38,17 @@ import { resolveAction } from "./keymap.ts";
 import type { ViewMode } from "./state/store.ts";
 import { Store } from "./state/store.ts";
 import { setEnabled as setColorEnabled } from "./term/ansi.ts";
+import { BG_QUERY } from "./term/bgColor.ts";
 import * as caps from "./term/caps.ts";
 import { Input, type Key } from "./term/input.ts";
 import * as osc from "./term/osc.ts";
 import { ATTR_DIM, Screen } from "./term/screen.ts";
-import { type IconSet, colors, isIconSet } from "./term/theme.ts";
+import {
+  type IconSet,
+  colors,
+  isIconSet,
+  setDetectedBackground,
+} from "./term/theme.ts";
 import { truncate } from "./term/width.ts";
 import {
   computeFrame,
@@ -66,7 +72,11 @@ import {
 } from "./ui/listView.ts";
 import { renderBookmarksOverlay } from "./ui/overlay/bookmarks.ts";
 import { renderConfirmOverlay } from "./ui/overlay/confirm.ts";
-import { maxHelpScroll, renderHelpOverlay } from "./ui/overlay/help.ts";
+import {
+  HELP_TABS,
+  maxHelpScroll,
+  renderHelpOverlay,
+} from "./ui/overlay/help.ts";
 import { renderPermissionsOverlay } from "./ui/overlay/permissions.ts";
 import {
   maxPreviewScroll,
@@ -312,11 +322,16 @@ function draw(screen: Screen): void {
     store.isBookmarked(),
   );
   const listEntries = state.view === "list" ? store.visibleEntries() : [];
+  // The file view area gets one column of right padding so content never
+  // sits flush against the terminal's edge — rules and the banner/footer
+  // still span the full width `w`.
+  const contentWidth = Math.max(w - 1, 0);
   // Computed once and threaded through both the header and the row
   // rendering below — never recomputed separately — so the two can never
   // disagree about where a column starts (see ui/listView.ts's file
   // header).
-  const listLayout = state.view === "list" ? computeListLayout(w) : null;
+  const listLayout =
+    state.view === "list" ? computeListLayout(contentWidth) : null;
   if (frame.headerY !== null && listLayout !== null) {
     renderListHeader(screen, 0, frame.headerY, listLayout);
   }
@@ -324,13 +339,16 @@ function draw(screen: Screen): void {
 
   if (frame.listHeight > 0) {
     if (state.scanError) {
-      screen.put(0, frame.listY, truncate(`error: ${state.scanError}`, w), {
-        fg: colors.error,
-      });
+      screen.put(
+        0,
+        frame.listY,
+        truncate(`error: ${state.scanError}`, contentWidth),
+        { fg: colors.error },
+      );
       screen.put(
         0,
         frame.listY + 1,
-        frame.listHeight > 1 ? truncate("press ← to go up", w) : "",
+        frame.listHeight > 1 ? truncate("press ← to go up", contentWidth) : "",
         { attr: ATTR_DIM },
       );
     } else if (state.view === "grid") {
@@ -338,7 +356,7 @@ function draw(screen: Screen): void {
       const bookmarks = store.bookmarkedPaths();
       const gitStatuses = store.gitStatuses();
       const layout = computeGridLayout(
-        w,
+        contentWidth,
         entries.map((e) => entryDisplayWidth(e, bookmarks, gitStatuses)),
       );
       const rows = gridRowCount(entries.length, layout.columns);
@@ -353,7 +371,7 @@ function draw(screen: Screen): void {
         screen,
         0,
         frame.listY,
-        w,
+        contentWidth,
         frame.listHeight,
         entries,
         state.cursor,
@@ -372,7 +390,7 @@ function draw(screen: Screen): void {
         screen,
         0,
         frame.listY,
-        w,
+        contentWidth,
         frame.listHeight,
         listEntries,
         after.cursor,
@@ -449,7 +467,13 @@ function draw(screen: Screen): void {
       error: state.overlay.error,
     });
   } else if (state.overlay?.kind === "help") {
-    renderHelpOverlay(screen, w, h, state.overlay.scrollOffset);
+    renderHelpOverlay(
+      screen,
+      w,
+      h,
+      state.overlay.scrollOffset,
+      state.overlay.tab,
+    );
   } else if (state.overlay?.kind === "preview") {
     renderPreviewOverlay(screen, w, h, state.overlay);
   } else if (state.overlay?.kind === "bookmarks") {
@@ -631,7 +655,7 @@ function handleNavigate(dir: "up" | "down" | "left" | "right"): void {
   const bookmarks = store.bookmarkedPaths();
   const gitStatuses = store.gitStatuses();
   const layout = computeGridLayout(
-    Math.max(screen.columns, 1),
+    Math.max(screen.columns - 1, 0),
     entries.map((e) => entryDisplayWidth(e, bookmarks, gitStatuses)),
   );
   if (layout.columns === 0) return;
@@ -701,11 +725,24 @@ input.onKey((key: Key) => {
     case "help":
       store.startHelp();
       break;
-    case "helpScroll":
+    case "helpScroll": {
+      const overlay = store.getState().overlay;
+      const lineCount =
+        overlay?.kind === "help"
+          ? (HELP_TABS[overlay.tab]?.lines.length ?? 0)
+          : 0;
       store.helpScroll(
         action.delta,
-        maxHelpScroll(Math.max(screen.columns, 1), Math.max(screen.rows, 1)),
+        maxHelpScroll(
+          Math.max(screen.columns, 1),
+          Math.max(screen.rows, 1),
+          lineCount,
+        ),
       );
+      break;
+    }
+    case "helpTab":
+      store.helpTab(action.delta, HELP_TABS.length);
       break;
     case "previewScroll": {
       const overlay = store.getState().overlay;
@@ -883,12 +920,35 @@ input.onFocus((focused) => {
   // On focus-out this just leaves `dirty` set for whenever focus returns
   // (see requestRepaint's own comment). On focus-in it's what actually
   // flushes a single repaint covering everything that changed underneath
-  // the pane while it was hidden.
+  // the pane while it was hidden — and a good extra moment to recheck the
+  // terminal's background (below), since switching back from another app
+  // or window is a common point for an OS-level light/dark switch to have
+  // happened while this pane sat unfocused.
+  if (focused) process.stdout.write(BG_QUERY);
+  requestRepaint();
+});
+
+// There's no escape sequence a terminal uses to *announce* a background
+// change on its own — term/input.ts recognizes an OSC 11 reply whenever one
+// arrives and dispatches it here, but this codebase has to keep re-sending
+// BG_QUERY (on the timer below, and on focus-in above) for a mid-session
+// theme switch (macOS dark/light, an iTerm2 profile change, ...) to ever be
+// picked up at all, rather than only detecting the background once at
+// startup and leaving it stale for the rest of the session.
+input.onBgColor((color) => {
+  setDetectedBackground(color);
   requestRepaint();
 });
 
 input.start();
 process.stdin.resume();
+process.stdout.write(BG_QUERY);
+
+const BG_RECHECK_MS = 5000;
+const bgRecheckTimer = setInterval(() => {
+  process.stdout.write(BG_QUERY);
+}, BG_RECHECK_MS);
+caps.onTeardown(() => clearInterval(bgRecheckTimer));
 
 // ── resize ──
 // SIGWINCH fires constantly under herdr (pane splits, zoom, sidebar

@@ -3,8 +3,9 @@
 // it. SPEC.md asks for a real banner ("render visually beautifully, using
 // color and extended characters ... to create windows, lines, columns") and
 // for the breadcrumb to sit in it "before any path contents is rendered" —
-// so the banner here is a genuine box-drawn window when there is room for
-// one, not a bare line of text.
+// so the banner here is the breadcrumb text plus a single rule beneath it
+// (the box's bottom edge, minus the top and side edges) separating it from
+// whatever's below, not a 4-sided box.
 //
 // `computeFrame()` is the one function that decides, given a terminal size
 // and the active view, which chrome elements exist this frame and which row
@@ -201,30 +202,23 @@ export function renderBreadcrumb(
 
 // ── frame layout ──
 //
-// The banner is a genuine box (┌─┐ / │ text │ / └─┘) when the terminal is
-// roomy enough, its bottom border doing double duty as "the horizontal rule
-// separating banner from body" the design pass asks for. Column headers
-// only make sense for the list view (grid has no Size/Mode/Owner/Group/
-// Modified columns to label), so they — and their own separating rule — are
-// only reserved when `view === "list"` and there is room. Everything
+// The banner is just the breadcrumb row plus a rule beneath it separating
+// banner from body — no top border and no side borders, so the row a 4-sided
+// box would have spent on its top edge goes to the list instead. Column
+// headers only make sense for the list view (grid has no Size/Mode/Owner/
+// Group/Modified columns to label), so they — and their own separating rule
+// — are only reserved when `view === "list"` and there is room. Everything
 // degrades a tier at a time as height shrinks, and `listHeight` is always
 // clamped at 0 rather than going negative, so a caller never has to guard
 // against a degenerate terminal itself.
 
-const MIN_WIDTH_FOR_BORDER = 24;
-const MIN_HEIGHT_FOR_BORDER = 9;
 const MIN_HEIGHT_FOR_HEADER = 9;
 
 export type Frame = {
-  /** Whether the banner is drawn as a bordered box (┌─┐/│…│/└─┘) this frame. */
-  border: boolean;
-  /** Row of the top border, only set when `border` is true. */
-  bannerTopY: number | null;
   /** Row the breadcrumb text itself is drawn on — always present. */
   breadcrumbY: number;
   /**
-   * Row separating the banner from the body: the box's bottom border when
-   * `border` is true, a plain rule otherwise. `null` only when the terminal
+   * Rule separating the banner from the body. `null` only when the terminal
    * is too short to spare even this one row.
    */
   bannerRuleY: number | null;
@@ -245,15 +239,9 @@ export function computeFrame(
   view: "list" | "grid",
 ): Frame {
   const h = Math.max(height, 1);
-  const border = width >= MIN_WIDTH_FOR_BORDER && h >= MIN_HEIGHT_FOR_BORDER;
   const header = view === "list" && h >= MIN_HEIGHT_FOR_HEADER;
 
   let y = 0;
-  let bannerTopY: number | null = null;
-  if (border) {
-    bannerTopY = y;
-    y++;
-  }
   const breadcrumbY = y;
   y++;
 
@@ -288,8 +276,6 @@ export function computeFrame(
   const listHeight = Math.max(h - y - bottomReserved, 0);
 
   return {
-    border,
-    bannerTopY,
     breadcrumbY,
     bannerRuleY,
     headerY,
@@ -308,11 +294,9 @@ export function renderRule(screen: Screen, y: number, width: number): void {
 }
 
 /**
- * Draw the banner: a bordered box around the breadcrumb when `frame.border`
- * is set (its bottom edge is the banner/body rule), or the breadcrumb as a
- * plain line followed by a plain rule otherwise. Either way, the breadcrumb
- * is on screen "before any path contents is rendered" per SPEC.md, and a
- * rule always separates it from the body when there is room for one.
+ * Draw the banner: the breadcrumb as a plain line, followed by a rule
+ * separating it from the body when there's room for one. The breadcrumb is
+ * on screen "before any path contents is rendered" per SPEC.md either way.
  */
 export function renderBanner(
   screen: Screen,
@@ -322,19 +306,6 @@ export function renderBanner(
   archive?: ArchiveBreadcrumb | null,
   bookmarked?: boolean,
 ): void {
-  if (frame.border && frame.bannerTopY !== null) {
-    screen.box(0, frame.bannerTopY, width, 3, { fg: colors.chrome });
-    renderBreadcrumb(
-      screen,
-      2,
-      frame.breadcrumbY,
-      Math.max(width - 4, 0),
-      cwd,
-      archive,
-      bookmarked,
-    );
-    return;
-  }
   renderBreadcrumb(
     screen,
     0,
